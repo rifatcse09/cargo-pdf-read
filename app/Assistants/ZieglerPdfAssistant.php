@@ -325,29 +325,61 @@ class ZieglerPdfAssistant extends PdfClient
         $currency = null;
 
         foreach ($lines as $line) {
-            // "Rate € 1,000"
+            Log::info("Checking freight line: {$line}");
+
+            // "Rate € 1,000" or "Rate € 1.15" - more flexible pattern
             if (preg_match('/Rate\s*€\s*([0-9,.\s]+)/i', $line, $m)) {
-                $price = (float) str_replace([',', ' '], '', $m[1]);
+                $cleanPrice = function_exists('uncomma') ? uncomma($m[1]) : str_replace([',', ' '], '', $m[1]);
+                $price = (float) $cleanPrice;
                 $currency = 'EUR';
+                Log::info("Found Rate € pattern: original='{$m[1]}', cleaned='{$cleanPrice}', final={$price}");
                 break;
             }
+
+            // "€ 1,000" or "€ 1.15" - Euro symbol first
+            if (preg_match('/€\s*([0-9,.\s]+)/i', $line, $m)) {
+                $cleanPrice = function_exists('uncomma') ? uncomma($m[1]) : str_replace([',', ' '], '', $m[1]);
+                $price = (float) $cleanPrice;
+                $currency = 'EUR';
+                Log::info("Found € pattern: original='{$m[1]}', cleaned='{$cleanPrice}', final={$price}");
+                break;
+            }
+
+            // "1,000 €" or "1.15 €" - Euro symbol after
+            if (preg_match('/([0-9,.\s]+)\s*€/i', $line, $m)) {
+                $cleanPrice = function_exists('uncomma') ? uncomma($m[1]) : str_replace([',', ' '], '', $m[1]);
+                $price = (float) $cleanPrice;
+                $currency = 'EUR';
+                Log::info("Found amount € pattern: original='{$m[1]}', cleaned='{$cleanPrice}', final={$price}");
+                break;
+            }
+
             // "Price: EUR 1000"
             if (preg_match('/Price[:\s]*EUR\s*([0-9,.\s]+)/i', $line, $m)) {
-                $price = (float) str_replace([',', ' '], '', $m[1]);
+                $cleanPrice = function_exists('uncomma') ? uncomma($m[1]) : str_replace([',', ' '], '', $m[1]);
+                $price = (float) $cleanPrice;
                 $currency = 'EUR';
+                Log::info("Found Price EUR pattern: original='{$m[1]}', cleaned='{$cleanPrice}', final={$price}");
                 break;
             }
+
             // Generic currency patterns
             if (preg_match('/(EUR|GBP|USD)\s*([0-9,.\s]+)/i', $line, $m)) {
                 $currency = strtoupper($m[1]);
-                $price = (float) str_replace([',', ' '], '', $m[2]);
+                $cleanPrice = function_exists('uncomma') ? uncomma($m[2]) : str_replace([',', ' '], '', $m[2]);
+                $price = (float) $cleanPrice;
+                Log::info("Found {$currency} pattern: original='{$m[2]}', cleaned='{$cleanPrice}', final={$price}");
                 break;
             }
+
             if (preg_match('/([€£$])\s*([0-9,.\s]+)/', $line, $m)) {
                 $currency = ['€' => 'EUR', '£' => 'GBP', '$' => 'USD'][$m[1]] ?? null;
-                $price = (float) str_replace([',', ' '], '', $m[2]);
+                $cleanPrice = function_exists('uncomma') ? uncomma($m[2]) : str_replace([',', ' '], '', $m[2]);
+                $price = (float) $cleanPrice;
+                Log::info("Found symbol {$m[1]} pattern: original='{$m[2]}', cleaned='{$cleanPrice}', final={$price}");
                 if ($currency) break;
             }
+
             // Look for just currency symbols/codes without price
             if (preg_match('/\b(EUR|GBP|USD)\b/i', $line, $m)) {
                 $currency = $currency ?: strtoupper($m[1]);
@@ -360,6 +392,8 @@ class ZieglerPdfAssistant extends PdfClient
             }
         }
 
+        Log::info("Final freight result: price={$price}, currency={$currency}");
+
         // Default to EUR if no currency found (common for Ziegler)
         return [
             'price' => $price,
@@ -369,197 +403,97 @@ class ZieglerPdfAssistant extends PdfClient
 
     protected function extractLoadingLocations(array $lines): array
     {
-        return $this->extractLocations($lines, ['Collection ']);
-    }
-
-    protected function extractDestinationLocations(array $lines): array
-    {
-        return $this->extractLocations($lines, ['Delivery ']);
-    }
-
-    protected function extractLocations(array $lines, array $markers): array
-    {
         $locations = [];
+        $currentLocation = null;
 
-        foreach ($lines as $i => $line) {
-            foreach ($markers as $marker) {
-                if (Str::startsWith($line, $marker)) {
-                    $location = $this->parseLocationSection($lines, $i);
-                    if ($location) {
-                        $locations[] = $location;
-                    }
-                    break;
+        foreach ($lines as $line) {
+            // Detect start of a new location block
+            if (Str::contains(Str::upper($line), 'LOADING LOCATION')) {
+                if ($currentLocation) {
+                    $locations[] = $currentLocation;
                 }
+                $currentLocation = ['company_address' => []];
+                continue;
             }
+
+            // Parse address components
+            if ($currentLocation) {
+                $this->parseAddressComponents($line, $currentLocation['company_address']);
+            }
+        }
+
+        // Add the last location if any
+        if ($currentLocation) {
+            $locations[] = $currentLocation;
         }
 
         return $locations;
     }
 
-    protected function parseLocationSection(array $lines, int $startIdx): ?array
+    protected function extractDestinationLocations(array $lines): array
     {
-        // Get section lines until next section or end
-        $sectionLines = [];
-        for ($i = $startIdx; $i < count($lines); $i++) {
-            $line = $lines[$i];
+        $locations = [];
+        $currentLocation = null;
 
-            // Stop at new section
-            if ($i > $startIdx && $this->isNewLocationSection($line)) {
-                break;
+        foreach ($lines as $line) {
+            // Detect start of a new location block
+            if (Str::contains(Str::upper($line), 'DESTINATION LOCATION')) {
+                if ($currentLocation) {
+                    $locations[] = $currentLocation;
+                }
+                $currentLocation = ['company_address' => []];
+                continue;
             }
 
-            $sectionLines[] = $line;
-        }
-
-        // Parse company from first line
-        $firstLine = $sectionLines[0] ?? '';
-        if (preg_match('/(Collection|Delivery)\s+(.+?)\s+REF$/i', $firstLine, $m)) {
-            $company = trim($m[2]);
-        } else {
-            return null;
-        }
-
-        // Parse address, time, and other details
-        $address = ['company' => $company];
-        $timeObj = null;
-        $date = null;
-        $timeRange = null;
-
-        foreach ($sectionLines as $line) {
-            // Date (dd/mm/yyyy)
-            if (preg_match('/(\d{2}\/\d{2}\/\d{4})/', $line, $m)) {
-                $date = $m[1];
-            }
-
-            // Time patterns
-            $timeRange = $this->parseTimeFromLine($line) ?: $timeRange;
-
-            // Address components
-            $this->parseAddressComponents($line, $address);
-        }
-
-        // Build time object
-        if ($timeRange && $date) {
-            $timeObj = $this->buildTimeObject($date, $timeRange);
-        }
-
-        // Detect country if not set
-        if (!isset($address['country_code'])) {
-            $address['country_code'] = $this->detectCountryFromSection($sectionLines);
-        }
-
-        return [
-            'company_address' => array_filter($address),
-            'time' => $timeObj
-        ];
-    }
-
-    protected function isNewLocationSection(string $line): bool
-    {
-        return Str::startsWith($line, ['Collection ', 'Delivery ', '- Payment', '- All business']);
-    }
-
-    protected function parseTimeFromLine(string $line): ?array
-    {
-        // "0900-2pm" or "0900-3PM"
-        if (preg_match('/(\d{4})-(\d+)(?:pm|PM)/i', $line, $m)) {
-            $start = substr($m[1], 0, 2) . ':' . substr($m[1], 2, 2);
-            $end = sprintf('%02d:00', (int)$m[2]);
-            return ['start' => $start, 'end' => $end];
-        }
-
-        // "BOOKED-06:00 AM"
-        if (preg_match('/BOOKED-(\d{2}:\d{2})/i', $line, $m)) {
-            return ['start' => $m[1]];
-        }
-
-        // "09:00 Time To: 12:00"
-        if (preg_match('/(\d{2}:\d{2})\s+Time\s+To:\s+(\d{2}:\d{2})/i', $line, $m)) {
-            return ['start' => $m[1], 'end' => $m[2]];
-        }
-
-        // "09:00 - 15:00"
-        if (preg_match('/(\d{1,2}:\d{2})\s*[-–—]\s*(\d{1,2}:\d{2})/', $line, $m)) {
-            return ['start' => $m[1], 'end' => $m[2]];
-        }
-
-        return null;
-    }
-
-    protected function buildTimeObject(string $date, array $timeRange): ?array
-    {
-        try {
-            $carbonDate = Carbon::createFromFormat('d/m/Y', $date);
-
-            $timeObj = [
-                'datetime_from' => $carbonDate->copy()
-                    ->setTimeFromTimeString($timeRange['start'])
-                    ->toIso8601String()
-            ];
-
-            if (isset($timeRange['end'])) {
-                $timeObj['datetime_to'] = $carbonDate->copy()
-                    ->setTimeFromTimeString($timeRange['end'])
-                    ->toIso8601String();
-            }
-
-            return $timeObj;
-        } catch (\Exception $e) {
-            return null;
-        }
-    }
-
-    protected function detectCountryFromSection(array $sectionLines): ?string
-    {
-        $text = collect($sectionLines)->implode(' ');
-
-        // Postal code patterns
-        if (preg_match('/[A-Z]{1,2}\d+\s+\d[A-Z]{2}/', $text)) return 'GB';
-        if (preg_match('/\d{5}\s+[A-Z]+/', $text)) return 'FR';
-
-        // Street indicators
-        if (Str::contains($text, ['RUE', 'Chem.'])) return 'FR';
-        if (Str::contains($text, ['ROAD', 'LANE'])) return 'GB';
-
-        // Try GeonamesCountry for city names
-        foreach ($sectionLines as $line) {
-            if (preg_match('/\b([A-Z\s]{4,})\b/', $line, $m)) {
-                $cityName = trim($m[1]);
-                $iso = GeonamesCountry::getIso($cityName);
-                if ($iso) return $iso;
+            // Parse address components
+            if ($currentLocation) {
+                $this->parseAddressComponents($line, $currentLocation['company_address']);
             }
         }
 
-        return null;
+        // Add the last location if any
+        if ($currentLocation) {
+            $locations[] = $currentLocation;
+        }
+
+        return $locations;
     }
 
     protected function extractCargos(array $lines): array
     {
         $cargos = [];
+        $currentCargo = null;
 
         foreach ($lines as $line) {
-            // "20 pallets" or "10 PALLETS"
-            if (preg_match('/(\d+)\s+pallets?/i', $line, $m)) {
-                $cargos[] = [
-                    'title' => 'Palletized goods',
-                    'package_count' => (int) $m[1],
-                    'package_type' => 'pallet'
-                ];
+            // Detect start of a new cargo block
+            if (Str::contains(Str::upper($line), 'CARGO')) {
+                if ($currentCargo) {
+                    $cargos[] = $currentCargo;
+                }
+                $currentCargo = ['title' => '', 'package_count' => 0];
+                continue;
             }
-            // Other package types
-            elseif (preg_match('/(\d+)\s+(packages?|cartons?|boxes?)/i', $line, $m)) {
-                $cargos[] = [
-                    'title' => 'Packaged goods',
-                    'package_count' => (int) $m[1],
-                    'package_type' => 'package'
-                ];
+
+            // Parse cargo details
+            if ($currentCargo) {
+                if (preg_match('/Title[:\s]*(.+)/i', $line, $m)) {
+                    $currentCargo['title'] = trim($m[1]);
+                }
+                if (preg_match('/Package Count[:\s]*(\d+)/i', $line, $m)) {
+                    $currentCargo['package_count'] = (int) $m[1];
+                }
             }
+        }
+
+        // Add the last cargo if any
+        if ($currentCargo) {
+            $cargos[] = $currentCargo;
         }
 
         return $cargos;
     }
 
-    protected function extractComment(array $lines): ?string
+    protected function extractComment(array $lines): string
     {
         $parts = [];
 
@@ -584,6 +518,7 @@ class ZieglerPdfAssistant extends PdfClient
             $parts[] = 'Notes: Delivery to any address other than listed is prohibited without permission; signed POD required for payment';
         }
 
-        return collect($parts)->filter()->implode('. ') . (count($parts) ? '.' : '') ?: null;
+        // Return empty string if no parts found, otherwise join with periods
+        return collect($parts)->filter()->implode('. ') . (count($parts) ? '.' : '');
     }
 }
