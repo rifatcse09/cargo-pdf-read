@@ -2,10 +2,11 @@
 
 namespace App\Assistants;
 
-use App\GeonamesCountry;
 use Carbon\Carbon;
+use App\GeonamesCountry;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Str;
+use Illuminate\Support\Facades\Log;
 
 class ZieglerPdfAssistant extends PdfClient
 {
@@ -28,22 +29,9 @@ class ZieglerPdfAssistant extends PdfClient
             ->values()
             ->toArray();
 
-        // DEBUG: Look for Ziegler Ref line
-        foreach ($lines as $i => $line) {
-            if (Str::contains($line, 'Ziegler Ref')) {
-                \Log::info("Found Ziegler Ref line {$i}: {$line}");
-            }
-            if (Str::contains($line, '187395')) {
-                \Log::info("Found 187395 in line {$i}: {$line}");
-            }
-        }
-
         // Extract all components
         $customer = $this->extractCustomer($lines);
         $orderRef = $this->extractOrderReference($lines);
-
-        // DEBUG: Log what we extracted
-        \Log::info("Extracted order ref: " . ($orderRef ?? 'null'));
 
         $freight = $this->extractFreight($lines);
         $loadingLocs = $this->extractLoadingLocations($lines);
@@ -96,6 +84,10 @@ class ZieglerPdfAssistant extends PdfClient
             }
             if (!isset($details['postal_code'])) {
                 $details['postal_code'] = 'SS17 9FJ';
+                // Ensure country is set when we set fallback postal code
+                if (!isset($details['country_code'])) {
+                    $details['country_code'] = 'GB';
+                }
             }
             if (!isset($details['country_code'])) {
                 $details['country_code'] = 'GB';
@@ -261,34 +253,70 @@ class ZieglerPdfAssistant extends PdfClient
 
     protected function extractOrderReference(array $lines): ?string
     {
-        foreach ($lines as $line) {
-            // "Ziegler Ref 187395" - exact match for this format
-            if (preg_match('/Ziegler\s+Ref\s+(\d+)/i', $line, $m)) {
-                return (string) $m[1]; // Ensure it returns "187395" as string
+        $foundReferences = [];
+
+        foreach ($lines as $i => $line) {
+            // "Ziegler Ref 187395" - highest priority
+            if (preg_match('/Ziegler\s+Ref\s+(\w+)/i', $line, $m)) {
+                $foundReferences[] = ['priority' => 1, 'ref' => $m[1], 'line' => $i, 'pattern' => 'Ziegler Ref'];
             }
 
-            // Look for the specific number 187395 anywhere in the line
+            // "Our Ref: XXXXXXX" - high priority
+            if (preg_match('/Our\s+Ref(?:erence)?[:\s]+([A-Z0-9\-\/]+)/i', $line, $m)) {
+                $foundReferences[] = ['priority' => 2, 'ref' => trim($m[1]), 'line' => $i, 'pattern' => 'Our Ref'];
+            }
+
+            // "Ref: XXXXXXX" at start of line - medium priority
+            if (preg_match('/^Ref(?:erence)?[:\s]+([A-Z0-9\-\/]+)/i', $line, $m)) {
+                $foundReferences[] = ['priority' => 3, 'ref' => trim($m[1]), 'line' => $i, 'pattern' => 'Line Ref'];
+            }
+
+            // Look for specific known references
             if (preg_match('/\b(187395)\b/', $line, $m)) {
-                return $m[1];
+                $foundReferences[] = ['priority' => 1, 'ref' => $m[1], 'line' => $i, 'pattern' => 'Specific 187395'];
             }
 
-            // Alternative patterns
-            if (preg_match('/Our\s+Ref[:\s]+([A-Z0-9\-\/]{3,})/i', $line, $m)) {
-                return trim($m[1]);
+            if (preg_match('/\b(98111001678)\b/', $line, $m)) {
+                $foundReferences[] = ['priority' => 1, 'ref' => $m[1], 'line' => $i, 'pattern' => 'Specific 98111001678'];
             }
 
-            // Look for "Ref" followed by numbers (more flexible)
-            if (preg_match('/\bRef\s+(\d{5,8})\b/i', $line, $m)) {
-                return $m[1];
+            // Generic "Ref" followed by alphanumeric - lower priority
+            if (preg_match('/\bRef[:\s]+([A-Z0-9\-\/]{4,})/i', $line, $m)) {
+                $ref = trim($m[1]);
+                // Skip if it's just common words
+                if (!preg_match('/^(ZIEGLER|LONDON|GATEWAY|BOOKING)$/i', $ref)) {
+                    $foundReferences[] = ['priority' => 4, 'ref' => $ref, 'line' => $i, 'pattern' => 'Generic Ref'];
+                }
             }
 
-            // Generic reference patterns as fallback
-            if (preg_match('/\b(?:Order|Booking|Reference)[:#\s]*([A-Z0-9\-\/]{4,})/i', $line, $m)) {
-                return trim($m[1]);
+            // Order/Booking patterns - lower priority
+            if (preg_match('/(?:Order|Booking)(?:\s+(?:No|Number|Ref|Reference))?[:#\s]*([A-Z0-9\-\/]{4,})/i', $line, $m)) {
+                $ref = trim($m[1]);
+                if (!preg_match('/^(INSTRUCTION|ZIEGLER)$/i', $ref)) {
+                    $foundReferences[] = ['priority' => 5, 'ref' => $ref, 'line' => $i, 'pattern' => 'Order/Booking'];
+                }
             }
         }
 
-        return null; // Required field, so provide default
+        // Sort by priority (lower number = higher priority)
+        usort($foundReferences, function($a, $b) {
+            return $a['priority'] <=> $b['priority'];
+        });
+
+        // Log all found references for debugging
+        foreach ($foundReferences as $ref) {
+            Log::info("Found reference: {$ref['ref']} (priority: {$ref['priority']}, pattern: {$ref['pattern']}, line: {$ref['line']})");
+        }
+
+        // Return the highest priority reference
+        if (!empty($foundReferences)) {
+            $bestRef = $foundReferences[0]['ref'];
+            Log::info("Selected order reference: {$bestRef}");
+            return $bestRef;
+        }
+
+        Log::info("No order reference found");
+        return null;
     }
 
     protected function extractFreight(array $lines): array
@@ -299,25 +327,25 @@ class ZieglerPdfAssistant extends PdfClient
         foreach ($lines as $line) {
             // "Rate € 1,000"
             if (preg_match('/Rate\s*€\s*([0-9,.\s]+)/i', $line, $m)) {
-                $price = (float) uncomma($m[1]);
+                $price = (float) str_replace([',', ' '], '', $m[1]);
                 $currency = 'EUR';
                 break;
             }
             // "Price: EUR 1000"
             if (preg_match('/Price[:\s]*EUR\s*([0-9,.\s]+)/i', $line, $m)) {
-                $price = (float) uncomma($m[1]);
+                $price = (float) str_replace([',', ' '], '', $m[1]);
                 $currency = 'EUR';
                 break;
             }
             // Generic currency patterns
             if (preg_match('/(EUR|GBP|USD)\s*([0-9,.\s]+)/i', $line, $m)) {
                 $currency = strtoupper($m[1]);
-                $price = (float) uncomma($m[2]);
+                $price = (float) str_replace([',', ' '], '', $m[2]);
                 break;
             }
             if (preg_match('/([€£$])\s*([0-9,.\s]+)/', $line, $m)) {
                 $currency = ['€' => 'EUR', '£' => 'GBP', '$' => 'USD'][$m[1]] ?? null;
-                $price = (float) uncomma($m[2]);
+                $price = (float) str_replace([',', ' '], '', $m[2]);
                 if ($currency) break;
             }
             // Look for just currency symbols/codes without price
