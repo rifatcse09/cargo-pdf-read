@@ -450,19 +450,23 @@ class ZieglerPdfAssistant extends PdfClient
                 $confidence = 100;
                 $reason = 'Explicit Collection with company name';
                 Log::info("FOUND Collection pattern at line {$i}: company='{$m[1]}'");
-
-                // Always include Collection patterns, don't require address validation
-                // The address validation was too strict and missing valid entries
             }
 
             // Pattern 2: Specific company names that are known collection points
-            elseif (preg_match('/^(AKZO NOBEL|EPAC FULFILMENT SOLUTIONS LTD)$/i', $line)) {
+            elseif (preg_match('/^(AKZO NOBEL|EPAC FULFILMENT SOLUTIONS LTD|LINDAL VALVE CO LTD|IBF)$/i', $line)) {
                 $confidence = 95;
                 $reason = 'Known collection company';
                 Log::info("FOUND known company at line {$i}: '{$line}'");
             }
 
-            // Pattern 3: Company name with REF that appears independently
+            // Pattern 3: Company patterns with (C/O ...) format
+            elseif (preg_match('/^([A-Z\s]+)\s*\([C\/O\s][^)]+\)$/i', $line, $m)) {
+                $confidence = 90;
+                $reason = 'Company with C/O pattern';
+                Log::info("FOUND company with C/O at line {$i}: '{$line}'");
+            }
+
+            // Pattern 4: Company name with REF that appears independently
             elseif (preg_match('/^([A-Z][A-Z\s&\(\)\/\-\.C\/O]+)\s+REF\s+[A-Z0-9\/\-]+$/i', $line, $m)) {
                 // Check if this looks like a collection company with address info
                 $nextFewLines = array_slice($lines, $i + 1, 5);
@@ -481,7 +485,7 @@ class ZieglerPdfAssistant extends PdfClient
                 }
             }
 
-            // Pattern 4: Lines that look like company names followed by address patterns
+            // Pattern 5: Lines that look like company names followed by address patterns
             elseif (preg_match('/^([A-Z][A-Z\s&\(\)\/\-\.]{5,60})$/i', $line) &&
                      !preg_match('/\b(DELIVERY|RATE|TERMS|PAYMENT|DATE|CARRIER|ZIEGLER|ROAD|STREET|LANE|AVENUE|WAY|CLOSE|UNITS|HALL)\b/i', $line)) {
                 // Check if next few lines have address info
@@ -489,7 +493,7 @@ class ZieglerPdfAssistant extends PdfClient
                 $hasAddressInfo = false;
                 foreach ($nextFewLines as $nextLine) {
                     if (preg_match('/\b([A-Z]{1,2}\d+\s*\d[A-Z]{2}|\d{5})\b/', $nextLine) ||
-                        preg_match('/\b(ROAD|STREET|LANE|AVENUE|WAY|CLOSE|UNITS|HALL)\b/i', $nextLine)) {
+                        preg_match('/\b(ROAD|STREET|LANE|AVENUE|WAY|CLOSE|UNITS|HALL|Sevington|Ashford)\b/i', $nextLine)) {
                         $hasAddressInfo = true;
                         break;
                     }
@@ -659,8 +663,64 @@ class ZieglerPdfAssistant extends PdfClient
             Log::info("  Section line " . ($startLine + $i) . ": '{$line}'");
         }
 
+        // For debugging, let's also look at a few lines after the section end
+        Log::info("=== LINES AFTER SECTION END ===");
+        for ($i = $endLine + 1; $i <= min($endLine + 5, count($lines) - 1); $i++) {
+            if (isset($lines[$i])) {
+                Log::info("  After line {$i}: '{$lines[$i]}'");
+            }
+        }
+
         // Parse the section with enhanced validation
         $result = $this->parseLocationDetails($sectionLines, 'collection');
+
+        // If we didn't get good address data, try extending the section
+        if ($result && isset($result['company_address'])) {
+            $addr = $result['company_address'];
+
+            // Check if we need to look further for address data
+            if (($addr['street_address'] === 'TBC' || $addr['postal_code'] === 'TBC' || $addr['city'] === 'Unknown') &&
+                $endLine < count($lines) - 1) {
+
+                Log::info("Address data incomplete, looking further...");
+
+                // Look at the next few lines for address data
+                for ($i = $endLine + 1; $i <= min($endLine + 8, count($lines) - 1); $i++) {
+                    if (isset($lines[$i])) {
+                        $line = trim($lines[$i]);
+                        Log::info("Checking extended line {$i}: '{$line}'");
+
+                        // Stop if we hit another section
+                        if (preg_match('/^(Collection|Delivery|Rate\s*€|Terms|Payment|Carrier)/i', $line)) {
+                            Log::info("Hit new section, stopping extended search");
+                            break;
+                        }
+
+                        // Try to parse this line for address info
+                        $tempAddress = $addr;
+                        $this->parseAddressComponents($line, $tempAddress);
+
+                        // If we found better data, use it
+                        if ($tempAddress['street_address'] !== $addr['street_address'] && $tempAddress['street_address'] !== 'TBC') {
+                            $addr['street_address'] = $tempAddress['street_address'];
+                            Log::info("Found street from extended search: {$addr['street_address']}");
+                        }
+                        if ($tempAddress['city'] !== $addr['city'] && $tempAddress['city'] !== 'Unknown') {
+                            $addr['city'] = $tempAddress['city'];
+                            Log::info("Found city from extended search: {$addr['city']}");
+                        }
+                        if ($tempAddress['postal_code'] !== $addr['postal_code'] && $tempAddress['postal_code'] !== 'TBC') {
+                            $addr['postal_code'] = $tempAddress['postal_code'];
+                            $addr['country_code'] = $tempAddress['country_code'];
+                            Log::info("Found postal code from extended search: {$addr['postal_code']}");
+                        }
+                    }
+                }
+
+                // Update the result with better address data
+                $result['company_address'] = $addr;
+            }
+        }
 
         // Less strict validation - allow more results through
         if ($result && isset($result['company_address'])) {
@@ -673,6 +733,7 @@ class ZieglerPdfAssistant extends PdfClient
             }
 
             Log::info("Parsed collection location successfully: " . $addr['company']);
+            Log::info("Final address data: " . json_encode($addr));
         }
 
         return $result;
@@ -680,203 +741,42 @@ class ZieglerPdfAssistant extends PdfClient
 
     protected function findCollectionSectionEnd(array $lines, int $startLine): int
     {
-        $maxSectionSize = 12; // Reduce section size to be more precise
+        $maxSectionSize = 8; // Reduce section size to be more focused
 
         for ($i = $startLine + 1; $i < count($lines) && $i < $startLine + $maxSectionSize; $i++) {
             $line = trim($lines[$i]);
             if (empty($line)) continue;
 
+            Log::info("Checking section end at line {$i}: '{$line}'");
+
             // Stop at any new Collection or Delivery section
             if (preg_match('/^(Collection|Delivery)\s+[A-Z]/i', $line)) {
+                Log::info("Stopping at new Collection/Delivery section");
                 return $i - 1;
             }
 
             // Stop at rate/pricing information
             if (preg_match('/^Rate\s*€/i', $line)) {
+                Log::info("Stopping at Rate section");
                 return $i - 1;
             }
 
             // Stop at administrative sections
             if (preg_match('/^(Terms|Payment|Carrier|Date\s+\d)/i', $line)) {
+                Log::info("Stopping at administrative section");
                 return $i - 1;
             }
 
-            // Stop if we encounter "DELIVERY" keyword (case insensitive)
-            if (Str::contains(strtoupper($line), 'DELIVERY')) {
-                return $i - 1;
-            }
-
-            // Stop if we encounter what looks like another company+REF pattern
-            if (preg_match('/^[A-Z][A-Z\s&\(\)\/\-\.]+\s+REF\s+[A-Z0-9\/\-]+$/i', $line)) {
+            // Stop if we encounter what looks like another company+REF pattern that isn't part of this collection
+            if (preg_match('/^[A-Z][A-Z\s&\(\)\/\-\.]+\s+REF\s+[A-Z0-9\/\-]+$/i', $line) && $i > $startLine + 3) {
+                Log::info("Stopping at another company+REF pattern");
                 return $i - 1;
             }
         }
 
-        return min(count($lines) - 1, $startLine + $maxSectionSize - 1);
-    }
-
-    protected function parseLocationDetails(array $blockLines, string $type): ?array
-    {
-        Log::info("=== PARSING LOCATION DETAILS FOR " . strtoupper($type) . " ===");
-
-        $company = '';
-        $refComment = '';
-        $address = [
-            'street_address' => '',
-            'city' => '',
-            'postal_code' => '',
-            'country_code' => 'GB'
-        ];
-        $timeObj = null;
-
-        foreach ($blockLines as $lineIndex => $line) {
-            Log::info("Processing detail line {$lineIndex}: '{$line}'");
-
-            // Extract company name (first line or line with company indicators)
-            if (empty($company)) {
-                $company = $this->extractCompanyName($line);
-                if ($company) {
-                    Log::info("Extracted company: '{$company}'");
-                }
-            }
-
-            // Extract REF comment
-            if (preg_match('/REF\s+([A-Z0-9\/\-]+)/i', $line, $m)) {
-                $refComment = $m[1];
-                Log::info("Found REF: {$refComment}");
-            }
-
-            // Extract time information
-            $timeData = $this->extractTimeFromLine($line);
-            if ($timeData) {
-                $timeObj = $timeData;
-                Log::info("Found time: " . json_encode($timeObj));
-            }
-
-            // Parse address components - use the enhanced method
-            $this->parseAddressComponents($line, $address);
-        }
-
-        // Ensure we have a company name
-        if (empty($company)) {
-            $company = ucfirst($type) . ' Location';
-            Log::info("Using fallback company name: {$company}");
-        }
-
-        // Build the final address
-        $finalAddress = [
-            'company' => $company,
-            'street_address' => $address['street_address'] ?: 'TBC',
-            'city' => $address['city'] ?: 'Unknown',
-            'postal_code' => $address['postal_code'] ?: 'TBC',
-            'country_code' => $address['country_code']
-        ];
-
-        // Add REF comment if found
-        if ($refComment) {
-            $finalAddress['comment'] = $company . ' REF ' . $refComment;
-        }
-
-        $result = ['company_address' => $finalAddress];
-
-        // Add time if found
-        if ($timeObj) {
-            $result['time'] = $timeObj;
-        }
-
-        Log::info("=== FINAL LOCATION RESULT ===");
-        Log::info(json_encode($result, JSON_PRETTY_PRINT));
-
-        return $result;
-    }
-
-    protected function extractCompanyName(string $line): string
-    {
-        Log::info("Extracting company from: '{$line}'");
-
-        // Pattern 1: "Collection COMPANY_NAME" or "Collection COMPANY_NAME REF XXX"
-        if (preg_match('/^Collection\s+(.+?)(?:\s+REF\s+[A-Z0-9\/\-]+)?$/i', $line, $m)) {
-            $company = trim($m[1]);
-            Log::info("Found company via Collection pattern: '{$company}'");
-            return $company;
-        }
-
-        // Pattern 2: Company name with REF at end
-        if (preg_match('/^(.+?)\s+REF\s+[A-Z0-9\/\-]+$/i', $line, $m)) {
-            $company = trim($m[1]);
-            Log::info("Found company via REF pattern: '{$company}'");
-            return $company;
-        }
-
-        // Pattern 3: Specific company patterns like "AKZO NOBEL", "EPAC FULFILMENT SOLUTIONS LTD"
-        if (preg_match('/^(AKZO NOBEL|EPAC FULFILMENT SOLUTIONS LTD|[A-Z][A-Z\s&\(\)\/\-\.]+(LTD|LIMITED|CO|INC|CORP|PLC|GMBH|SOLUTIONS|LOGISTICS|FULFILMENT|NOBEL))(\s|$)/i', $line, $m)) {
-            $company = trim($m[1]);
-            Log::info("Found company via specific/business suffix pattern: '{$company}'");
-            return $company;
-        }
-
-        // Pattern 4: Two-word company names like "AKZO NOBEL"
-        if (preg_match('/^([A-Z]{3,}\s+[A-Z]{3,})$/i', $line) &&
-            !preg_match('/\d{2}\/\d{2}\/\d{4}/', $line) &&
-            !preg_match('/\b(ROAD|STREET|LANE|AVENUE|WAY|CLOSE|UNITS|HALL)\b/i', $line)) {
-            $company = trim($line);
-            Log::info("Found company via two-word pattern: '{$company}'");
-            return $company;
-        }
-
-        // Pattern 5: All caps lines that could be company names (but not addresses or streets)
-        if (preg_match('/^([A-Z][A-Z\s&\(\)\/\-\.C\/O]{5,50})$/i', $line) &&
-            !preg_match('/\d{2}\/\d{2}\/\d{4}/', $line) &&
-            !preg_match('/\b(ROAD|STREET|LANE|AVENUE|WAY|CLOSE|UNITS|HALL|LTD|LIMITED|SOLUTIONS|LOGISTICS|FULFILMENT)\b/i', $line) &&
-            !preg_match('/\b([A-Z]{1,2}\d+\s*\d[A-Z]{2}|\d{5})\b/', $line)) { // Not postal codes
-            $company = trim($line);
-            Log::info("Found company via all-caps pattern: '{$company}'");
-            return $company;
-        }
-
-        Log::info("No company name found in line");
-        return '';
-    }
-
-    protected function extractTimeFromLine(string $line): ?array
-    {
-        $date = null;
-        $timeStart = null;
-        $timeEnd = null;
-
-        // Extract date: DD/MM/YYYY
-        if (preg_match('/(\d{2}\/\d{2}\/\d{4})/', $line, $m)) {
-            $date = $m[1];
-            Log::info("Found date in line: {$date}");
-        }
-
-        // Extract time ranges: HHMM-HHMM format (like 0900-1400)
-        if (preg_match('/(\d{2})(\d{2})\s*[-–]\s*(\d{2})(\d{2})/', $line, $m)) {
-            $timeStart = sprintf('%02d:%02d', (int)$m[1], (int)$m[2]);
-            $timeEnd = sprintf('%02d:%02d', (int)$m[3], (int)$m[4]);
-            Log::info("Found time range in line: {$timeStart} - {$timeEnd}");
-        }
-        // Also try HH:MM-HH:MM format
-        elseif (preg_match('/(\d{2}):(\d{2})\s*[-–]\s*(\d{2}):(\d{2})/', $line, $m)) {
-            $timeStart = sprintf('%02d:%02d', (int)$m[1], (int)$m[2]);
-            $timeEnd = sprintf('%02d:%02d', (int)$m[3], (int)$m[4]);
-            Log::info("Found time range in line: {$timeStart} - {$timeEnd}");
-        }
-
-        // Build time object if we have all components
-        if ($date && $timeStart && $timeEnd) {
-            try {
-                $carbonDate = Carbon::createFromFormat('d/m/Y', $date);
-                return [
-                    'datetime_from' => $carbonDate->copy()->setTimeFromTimeString($timeStart)->format('c'),
-                    'datetime_to' => $carbonDate->copy()->setTimeFromTimeString($timeEnd)->format('c')
-                ];
-            } catch (\Exception $e) {
-                Log::error("Error building time object: " . $e->getMessage());
-            }
-        }
-
-        return null;
+        $endLine = min(count($lines) - 1, $startLine + $maxSectionSize - 1);
+        Log::info("Reached max section size, ending at line {$endLine}");
+        return $endLine;
     }
 
     protected function parseAddressComponents(string $line, array &$address): void
@@ -884,34 +784,56 @@ class ZieglerPdfAssistant extends PdfClient
         Log::info("Parsing address from line: '{$line}'");
 
         // Skip if this looks like a company name
-        if (preg_match('/^(AKZO NOBEL|EPAC FULFILMENT SOLUTIONS LTD)$/i', $line)) {
+        if (preg_match('/^(AKZO NOBEL|EPAC FULFILMENT SOLUTIONS LTD|LINDAL VALVE CO LTD|IBF)$/i', $line)) {
             Log::info("Skipping company name line for address parsing: '{$line}'");
             return;
         }
 
-        // UK postcode + city pattern: "HAWKWELL, SS5 4JL" or "IP14 2QU STOWMARKET"
-        if (preg_match('/([A-Z\s]+),?\s*([A-Z]{1,2}\d+\s*\d[A-Z]{2})$/i', $line, $m) ||
-            preg_match('/([A-Z]{1,2}\d+\s*\d[A-Z]{2})\s+([A-Z\s]+)$/i', $line, $m)) {
+        // Skip if this looks like a company with C/O pattern
+        if (preg_match('/^([A-Z\s]+)\s*\([C\/O\s][^)]+\)$/i', $line)) {
+            Log::info("Skipping company with C/O pattern for address parsing: '{$line}'");
+            return;
+        }
 
-            if (preg_match('/([A-Z\s]+),?\s*([A-Z]{1,2}\d+\s*\d[A-Z]{2})$/i', $line, $m)) {
-                // City, Postcode format
-                $address['city'] = trim($m[1]);
-                $address['postal_code'] = $m[2];
-            } else {
-                // Postcode City format
-                $address['postal_code'] = $m[1];
-                $address['city'] = trim($m[2]);
-            }
+        // Skip Collection header lines with REF (this is the key fix!)
+        if (preg_match('/^Collection\s+.*REF/i', $line)) {
+            Log::info("Skipping Collection header line for address parsing: '{$line}'");
+            return;
+        }
 
-            // Use GeonamesCountry to detect country from postal code - with null check
-            if (!empty($address['postal_code'])) {
-                $countryIso = GeonamesCountry::getIso($address['postal_code']);
-                $address['country_code'] = $countryIso ?: 'GB';
-            } else {
-                $address['country_code'] = 'GB';
-            }
+        // Skip if this line only contains REF
+        if (preg_match('/^REF\s+[A-Z0-9\/\-]+$/i', $line)) {
+            Log::info("Skipping REF line for address parsing: '{$line}'");
+            return;
+        }
 
-            Log::info("Found UK postcode+city: {$address['postal_code']} {$address['city']}");
+        // Skip if this line only contains pickup instructions
+        if (preg_match('/^PICK\s+UP\s+[A-Z0-9]+$/i', $line)) {
+            Log::info("Skipping pickup instruction line for address parsing: '{$line}'");
+            return;
+        }
+
+        // Skip if this line contains date/time
+        if (preg_match('/\d{2}\/\d{2}\/\d{4}|\d{4}-\d{4}/', $line)) {
+            Log::info("Skipping date/time line for address parsing: '{$line}'");
+            return;
+        }
+
+        // UK postcode + city pattern: "IP14 2QU STOWMARKET", "HAWKWELL, SS5 4JL"
+        if (preg_match('/([A-Z]{1,2}\d+\s+\d[A-Z]{2})\s+([A-Z\s]+)$/i', $line, $m)) {
+            // Postcode City format
+            $address['postal_code'] = $m[1];
+            $address['city'] = trim($m[2]);
+            $address['country_code'] = 'GB';
+            Log::info("Found UK postcode+city (format 1): {$address['postal_code']} {$address['city']}");
+            return;
+        }
+        elseif (preg_match('/([A-Z\s]+),\s*([A-Z]{1,2}\d+\s+\d[A-Z]{2})$/i', $line, $m)) {
+            // City, Postcode format
+            $address['city'] = trim($m[1]);
+            $address['postal_code'] = $m[2];
+            $address['country_code'] = 'GB';
+            Log::info("Found UK city+postcode (format 2): {$address['city']} {$address['postal_code']}");
             return;
         }
 
@@ -934,19 +856,23 @@ class ZieglerPdfAssistant extends PdfClient
 
         // Street address patterns - enhanced to capture specific patterns
         $streetPatterns = [
-            // Standard street names like "NEEDHAM ROAD"
+            // Standard street names like "NEEDHAM ROAD", "CHERRYCOURT WAY"
             '/^([A-Z\s]+(ROAD|RD|STREET|ST|LANE|LN|AVENUE|AVE|DRIVE|DR|CLOSE|CRESCENT|GROVE|PARK|PLACE|SQUARE|YARD|MEWS|GARDENS|GREEN|WAY))$/i',
+            // Complex streets like "CHERRYCOURT WAY, STANBRIDGE ROAD"
+            '/^([A-Z\s]+(WAY|ROAD|STREET|LANE|AVENUE|DRIVE|CLOSE),\s*[A-Z\s]+(ROAD|STREET|LANE|AVENUE|DRIVE|CLOSE))$/i',
             // Business/industrial addresses with UNITS like "GUSTED HALL UNITS"
             '/^([A-Z\s]+(UNITS|HALL|CENTRE|CENTER|INDUSTRIAL|ESTATE|BUSINESS|PARK))$/i',
-            // Complex addresses like "GUSTED HALL UNITS, GUSTED HALL LANE"
-            '/^([A-Z\s]+(UNITS|HALL),\s*[A-Z\s]+(LANE|ROAD|STREET|WAY|CLOSE|CRESCENT|GROVE|PARK|PLACE))$/i'
+            // Complex business addresses like "GUSTED HALL UNITS, GUSTED HALL LANE"
+            '/^([A-Z\s]+(UNITS|HALL),\s*[A-Z\s]+(LANE|ROAD|STREET|WAY|CLOSE|CRESCENT|GROVE|PARK|PLACE))$/i',
+            // Simple locations like "Sevington"
+            '/^(Sevington|[A-Z][a-z]+)$/i'
         ];
 
         foreach ($streetPatterns as $pattern) {
             if (preg_match($pattern, $line, $m) && empty($address['street_address'])) {
                 $address['street_address'] = trim($line); // Use full line for complex addresses
                 Log::info("Found street address: {$address['street_address']}");
-                break;
+                return;
             }
         }
 
@@ -986,10 +912,10 @@ class ZieglerPdfAssistant extends PdfClient
         }
 
         // City (all caps, no digits, reasonable length) - only if not already found and not a street
-        if (preg_match('/^([A-Z\s\'-]{3,30})$/i', $line) &&
+        if (preg_match('/^([A-Z\s\'-]{3,30}|[A-Z][a-z]+)$/i', $line) &&
             !preg_match('/\d/', $line) &&
             empty($address['city']) &&
-            !preg_match('/\b(ROAD|STREET|LANE|AVENUE|WAY|CLOSE|UNITS|HALL|LTD|LIMITED|SOLUTIONS|LOGISTICS|FULFILMENT)\b/i', $line)) {
+            !preg_match('/\b(ROAD|STREET|LANE|AVENUE|WAY|CLOSE|UNITS|HALL|LTD|LIMITED|SOLUTIONS|LOGISTICS|FULFILMENT|REF|COLLECTION|DELIVERY)\b/i', $line)) {
             $address['city'] = trim($line);
             Log::info("Found standalone city: {$address['city']}");
         }
@@ -1321,5 +1247,241 @@ class ZieglerPdfAssistant extends PdfClient
 
         // Return empty string if no parts found, otherwise join with periods
         return collect($parts)->filter()->implode('. ') . (count($parts) ? '.' : '');
+    }
+
+    protected function parseLocationDetails(array $blockLines, string $type): ?array
+    {
+        Log::info("=== PARSING LOCATION DETAILS FOR " . strtoupper($type) . " ===");
+        Log::info("Block lines: " . json_encode($blockLines));
+
+        $company = '';
+        $refComment = '';
+        $address = [
+            'street_address' => '',
+            'city' => '',
+            'postal_code' => '',
+            'country_code' => 'GB'
+        ];
+        $timeObj = null;
+
+        // Enhanced company extraction for multi-line format
+        for ($i = 0; $i < count($blockLines); $i++) {
+            $line = trim($blockLines[$i]);
+
+            // Look for company name patterns
+            if (empty($company) && preg_match('/^(AKZO NOBEL|EPAC FULFILMENT SOLUTIONS LTD|LINDAL VALVE CO LTD|IBF)$/i', $line)) {
+                $companyParts = [$line];
+
+                // Check if next line is "REF" (standalone) and skip it
+                if (isset($blockLines[$i + 1]) && trim($blockLines[$i + 1]) === 'REF') {
+                    $i++; // Skip the standalone REF line
+                }
+
+                // Check if next line is C/O pattern
+                if (isset($blockLines[$i + 1]) && preg_match('/^C\/O\s+(.+)$/i', trim($blockLines[$i + 1]), $m)) {
+                    $companyParts[] = '(' . trim($blockLines[$i + 1]) . ')';
+                    $i++; // Skip the C/O line as we've processed it
+                }
+
+                $company = implode(' ', $companyParts);
+                Log::info("Built company from multiple lines: '{$company}'");
+                continue;
+            }
+        }
+
+        foreach ($blockLines as $lineIndex => $line) {
+            Log::info("Processing detail line {$lineIndex}: '{$line}'");
+
+            // Skip lines we've already processed in company extraction
+            if (!empty($company) && (
+                preg_match('/^(AKZO NOBEL|EPAC FULFILMENT SOLUTIONS LTD|LINDAL VALVE CO LTD|IBF)$/i', $line) ||
+                trim($line) === 'REF' ||
+                preg_match('/^C\/O\s+/i', $line)
+            )) {
+                Log::info("Skipping already processed line: '{$line}'");
+                continue;
+            }
+
+            // Extract company name if not already found (fallback)
+            if (empty($company)) {
+                $extractedCompany = $this->extractCompanyName($line);
+                if ($extractedCompany) {
+                    $company = $extractedCompany;
+                    Log::info("Extracted company: '{$company}'");
+                    continue;
+                }
+            }
+
+            // Extract REF comment - look for "REF XXXXX" pattern
+            if (empty($refComment) && preg_match('/^REF\s+([A-Z0-9\/\-]+)$/i', $line, $m)) {
+                $refComment = $m[1];
+                Log::info("Found REF: {$refComment}");
+                continue;
+            }
+            // Also check for patterns like "PICK UP T1"
+            elseif (empty($refComment) && preg_match('/(PICK\s+UP\s+[A-Z0-9]+)/i', $line, $m)) {
+                $refComment = $m[1];
+                Log::info("Found pickup comment: {$refComment}");
+                continue;
+            }
+
+            // Extract time information
+            $timeData = $this->extractTimeFromLine($line);
+            if ($timeData) {
+                $timeObj = $timeData;
+                Log::info("Found time: " . json_encode($timeObj));
+                continue;
+            }
+
+            // Skip lines that look like headers or section markers
+            if (preg_match('/^(Collection|Delivery)\s/i', $line)) {
+                Log::info("Skipping header line: '{$line}'");
+                continue;
+            }
+
+            // Skip standalone REF lines (but not "REF XXXXX")
+            if (trim($line) === 'REF') {
+                Log::info("Skipping standalone REF line: '{$line}'");
+                continue;
+            }
+
+            // Parse address components
+            Log::info("Attempting to parse address from: '{$line}'");
+            $this->parseAddressComponents($line, $address);
+        }
+
+        // Ensure we have a company name
+        if (empty($company)) {
+            $company = ucfirst($type) . ' Location';
+            Log::info("Using fallback company name: {$company}");
+        }
+
+        // Build the final address
+        $finalAddress = [
+            'company' => $company,
+            'street_address' => $address['street_address'] ?: 'TBC',
+            'city' => $address['city'] ?: 'Unknown',
+            'postal_code' => $address['postal_code'] ?: 'TBC',
+            'country_code' => $address['country_code']
+        ];
+
+        // Add REF comment if found
+        if ($refComment) {
+            if (preg_match('/^PICK\s+UP/i', $refComment)) {
+                $finalAddress['comment'] = $refComment;
+            } else {
+                // Extract just the company name without C/O for the comment
+                $companyForComment = preg_replace('/\s*\([^)]+\)$/', '', $company);
+                $finalAddress['comment'] = $companyForComment . ' REF ' . $refComment;
+            }
+        }
+
+        $result = ['company_address' => $finalAddress];
+
+        // Add time if found
+        if ($timeObj) {
+            $result['time'] = $timeObj;
+        }
+
+        Log::info("=== FINAL LOCATION RESULT ===");
+        Log::info(json_encode($result, JSON_PRETTY_PRINT));
+
+        return $result;
+    }
+
+    protected function extractCompanyName(string $line): string
+    {
+        Log::info("Extracting company from: '{$line}'");
+
+        // Pattern 1: "Collection COMPANY_NAME" or "Collection COMPANY_NAME REF XXX"
+        if (preg_match('/^Collection\s+(.+?)(?:\s+REF\s+[A-Z0-9\/\-]+)?$/i', $line, $m)) {
+            $company = trim($m[1]);
+            Log::info("Found company via Collection pattern: '{$company}'");
+            return $company;
+        }
+
+        // Pattern 2: Company name with REF at end
+        if (preg_match('/^(.+?)\s+REF\s+[A-Z0-9\/\-]+$/i', $line, $m)) {
+            $company = trim($m[1]);
+            Log::info("Found company via REF pattern: '{$company}'");
+            return $company;
+        }
+
+        // Pattern 3: Company with (C/O ...) format like "AKZO NOBEL (C/O GXO LOGISTICS)"
+        if (preg_match('/^([A-Z\s]+)\s*\(([C\/O\s][^)]+)\)$/i', $line, $m)) {
+            $company = trim($m[1]) . ' (' . trim($m[2]) . ')';
+            Log::info("Found company via C/O pattern: '{$company}'");
+            return $company;
+        }
+
+        // Pattern 4: Specific company patterns
+        if (preg_match('/^(AKZO NOBEL|EPAC FULFILMENT SOLUTIONS LTD|LINDAL VALVE CO LTD|IBF|[A-Z][A-Z\s&\(\)\/\-\.]+(LTD|LIMITED|CO|INC|CORP|PLC|GMBH|SOLUTIONS|LOGISTICS|FULFILMENT|NOBEL|VALVE))(\s|$)/i', $line, $m)) {
+            $company = trim($m[1]);
+            Log::info("Found company via specific/business suffix pattern: '{$company}'");
+            return $company;
+        }
+
+        // Pattern 5: Two-word company names like "AKZO NOBEL"
+        if (preg_match('/^([A-Z]{3,}\s+[A-Z]{3,})$/i', $line) &&
+            !preg_match('/\d{2}\/\d{2}\/\d{4}/', $line) &&
+            !preg_match('/\b(ROAD|STREET|LANE|AVENUE|WAY|CLOSE|UNITS|HALL)\b/i', $line)) {
+            $company = trim($line);
+            Log::info("Found company via two-word pattern: '{$company}'");
+            return $company;
+        }
+
+        // Pattern 6: All caps lines that could be company names (but not addresses or streets)
+        if (preg_match('/^([A-Z][A-Z\s&\(\)\/\-\.C\/O]{5,50})$/i', $line) &&
+            !preg_match('/\d{2}\/\d{2}\/\d{4}/', $line) &&
+            !preg_match('/\b(ROAD|STREET|LANE|AVENUE|WAY|CLOSE|UNITS|HALL|LTD|LIMITED|SOLUTIONS|LOGISTICS|FULFILMENT)\b/i', $line) &&
+            !preg_match('/\b([A-Z]{1,2}\d+\s*\d[A-Z]{2}|\d{5})\b/', $line)) { // Not postal codes
+            $company = trim($line);
+            Log::info("Found company via all-caps pattern: '{$company}'");
+            return $company;
+        }
+
+        Log::info("No company name found in line");
+        return '';
+    }
+
+    protected function extractTimeFromLine(string $line): ?array
+    {
+        $date = null;
+        $timeStart = null;
+        $timeEnd = null;
+
+        // Extract date: DD/MM/YYYY
+        if (preg_match('/(\d{2}\/\d{2}\/\d{4})/', $line, $m)) {
+            $date = $m[1];
+            Log::info("Found date in line: {$date}");
+        }
+
+        // Extract time ranges: HHMM-HHMM format (like 0900-1400)
+        if (preg_match('/(\d{2})(\d{2})\s*[-–]\s*(\d{2})(\d{2})/', $line, $m)) {
+            $timeStart = sprintf('%02d:%02d', (int)$m[1], (int)$m[2]);
+            $timeEnd = sprintf('%02d:%02d', (int)$m[3], (int)$m[4]);
+            Log::info("Found time range in line: {$timeStart} - {$timeEnd}");
+        }
+        // Also try HH:MM-HH:MM format
+        elseif (preg_match('/(\d{2}):(\d{2})\s*[-–]\s*(\d{2}):(\d{2})/', $line, $m)) {
+            $timeStart = sprintf('%02d:%02d', (int)$m[1], (int)$m[2]);
+            $timeEnd = sprintf('%02d:%02d', (int)$m[3], (int)$m[4]);
+            Log::info("Found time range in line: {$timeStart} - {$timeEnd}");
+        }
+
+        // Build time object if we have all components
+        if ($date && $timeStart && $timeEnd) {
+            try {
+                $carbonDate = Carbon::createFromFormat('d/m/Y', $date);
+                return [
+                    'datetime_from' => $carbonDate->copy()->setTimeFromTimeString($timeStart)->format('c'),
+                    'datetime_to' => $carbonDate->copy()->setTimeFromTimeString($timeEnd)->format('c')
+                ];
+            } catch (\Exception $e) {
+                Log::error("Error building time object: " . $e->getMessage());
+            }
+        }
+
+        return null;
     }
 }
