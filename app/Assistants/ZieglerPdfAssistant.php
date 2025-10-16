@@ -38,7 +38,7 @@ class ZieglerPdfAssistant extends PdfClient
             ->filter(fn($l) => !empty($l))
             ->values()
             ->toArray();
-     //dd($lines);
+
         // Extract all components
         $customer = $this->extractCustomer($lines);
         $orderRef = $this->extractOrderReference($lines);
@@ -790,20 +790,26 @@ class ZieglerPdfAssistant extends PdfClient
         }
 
         // Skip if this looks like a company with C/O pattern
-        if (preg_match('/^([A-Z\s]+)\s*\([C\/O\s][^)]+\)$/i', $line)) {
-            Log::info("Skipping company with C/O pattern for address parsing: '{$line}'");
+        if (preg_match('/^C\/O\s+/i', $line)) {
+            Log::info("Skipping C/O line for address parsing: '{$line}'");
             return;
         }
 
-        // Skip Collection header lines with REF (this is the key fix!)
+        // Skip Collection header lines with REF
         if (preg_match('/^Collection\s+.*REF/i', $line)) {
             Log::info("Skipping Collection header line for address parsing: '{$line}'");
             return;
         }
 
-        // Skip if this line only contains REF
+        // Skip standalone REF line
+        if (trim($line) === 'REF') {
+            Log::info("Skipping standalone REF line for address parsing: '{$line}'");
+            return;
+        }
+
+        // Skip REF with code lines
         if (preg_match('/^REF\s+[A-Z0-9\/\-]+$/i', $line)) {
-            Log::info("Skipping REF line for address parsing: '{$line}'");
+            Log::info("Skipping REF code line for address parsing: '{$line}'");
             return;
         }
 
@@ -813,9 +819,15 @@ class ZieglerPdfAssistant extends PdfClient
             return;
         }
 
-        // Skip if this line contains date/time
-        if (preg_match('/\d{2}\/\d{2}\/\d{4}|\d{4}-\d{4}/', $line)) {
+        // Skip if this line contains date/time patterns
+        if (preg_match('/\d{2}\/\d{2}\/\d{4}|\d{4}-\d{4}|\d{4}-\d+[ap]m/i', $line)) {
             Log::info("Skipping date/time line for address parsing: '{$line}'");
+            return;
+        }
+
+        // Skip pallet/cargo lines
+        if (preg_match('/\d+\s+(pallets?|packages?)/i', $line)) {
+            Log::info("Skipping cargo line for address parsing: '{$line}'");
             return;
         }
 
@@ -921,6 +933,276 @@ class ZieglerPdfAssistant extends PdfClient
         }
     }
 
+    protected function extractTimeFromLine(string $line): ?array
+    {
+        $date = null;
+        $timeStart = null;
+        $timeEnd = null;
+
+        // Extract date: DD/MM/YYYY
+        if (preg_match('/(\d{2}\/\d{2}\/\d{4})/', $line, $m)) {
+            $date = $m[1];
+            Log::info("Found date in line: {$date}");
+        }
+
+        // Extract time ranges with enhanced patterns
+
+        // Pattern 1: HHMM-HHMM format (like 0900-1400)
+        if (preg_match('/(\d{2})(\d{2})\s*[-–]\s*(\d{2})(\d{2})/', $line, $m)) {
+            $timeStart = sprintf('%02d:%02d', (int)$m[1], (int)$m[2]);
+            $timeEnd = sprintf('%02d:%02d', (int)$m[3], (int)$m[4]);
+            Log::info("Found time range (HHMM-HHMM): {$timeStart} - {$timeEnd}");
+        }
+        // Pattern 2: HH:MM-HH:MM format
+        elseif (preg_match('/(\d{2}):(\d{2})\s*[-–]\s*(\d{2}):(\d{2})/', $line, $m)) {
+            $timeStart = sprintf('%02d:%02d', (int)$m[1], (int)$m[2]);
+            $timeEnd = sprintf('%02d:%02d', (int)$m[3], (int)$m[4]);
+            Log::info("Found time range (HH:MM-HH:MM): {$timeStart} - {$timeEnd}");
+        }
+        // Pattern 3: HHMM-HamPM format (like 0900-2pm, 0900-3PM)
+        elseif (preg_match('/(\d{2})(\d{2})\s*[-–]\s*(\d{1,2})\s*(pm|am)/i', $line, $m)) {
+            $startHour = (int)$m[1];
+            $startMin = (int)$m[2];
+            $endHour = (int)$m[3];
+            $endAmPm = strtolower($m[4]);
+
+            // Convert PM/AM to 24-hour format
+            if ($endAmPm === 'pm' && $endHour < 12) {
+                $endHour += 12;
+            } elseif ($endAmPm === 'am' && $endHour === 12) {
+                $endHour = 0;
+            }
+
+            $timeStart = sprintf('%02d:%02d', $startHour, $startMin);
+            $timeEnd = sprintf('%02d:%02d', $endHour, 0); // Assume :00 minutes if not specified
+            Log::info("Found time range (HHMM-HamPM): {$timeStart} - {$timeEnd}");
+        }
+        // Pattern 4: HH:MM-HamPM format (like 09:00-2pm)
+        elseif (preg_match('/(\d{1,2}):(\d{2})\s*[-–]\s*(\d{1,2})\s*(pm|am)/i', $line, $m)) {
+            $startHour = (int)$m[1];
+            $startMin = (int)$m[2];
+            $endHour = (int)$m[3];
+            $endAmPm = strtolower($m[4]);
+
+            // Convert PM/AM to 24-hour format
+            if ($endAmPm === 'pm' && $endHour < 12) {
+                $endHour += 12;
+            } elseif ($endAmPm === 'am' && $endHour === 12) {
+                $endHour = 0;
+            }
+
+            $timeStart = sprintf('%02d:%02d', $startHour, $startMin);
+            $timeEnd = sprintf('%02d:%02d', $endHour, 0);
+            Log::info("Found time range (HH:MM-HamPM): {$timeStart} - {$timeEnd}");
+        }
+
+        // Build time object if we have all components
+        if ($date && $timeStart && $timeEnd) {
+            try {
+                $carbonDate = Carbon::createFromFormat('d/m/Y', $date);
+                return [
+                    'datetime_from' => $carbonDate->copy()->setTimeFromTimeString($timeStart)->format('c'),
+                    'datetime_to' => $carbonDate->copy()->setTimeFromTimeString($timeEnd)->format('c')
+                ];
+            } catch (\Exception $e) {
+                Log::error("Error building time object: " . $e->getMessage());
+            }
+        }
+
+        return null;
+    }
+
+    protected function parseLocationDetails(array $blockLines, string $type): ?array
+    {
+        Log::info("=== PARSING LOCATION DETAILS FOR " . strtoupper($type) . " ===");
+        Log::info("Block lines: " . json_encode($blockLines));
+
+        $company = '';
+        $refComment = '';
+        $address = [
+            'street_address' => '',
+            'city' => '',
+            'postal_code' => '',
+            'country_code' => 'GB'
+        ];
+        $timeObj = null;
+        $dateFound = null;
+        $timeFound = null;
+
+        // Enhanced company extraction for multi-line format
+        for ($i = 0; $i < count($blockLines); $i++) {
+            $line = trim($blockLines[$i]);
+
+            // Look for company name patterns
+            if (empty($company) && preg_match('/^(AKZO NOBEL|EPAC FULFILMENT SOLUTIONS LTD|LINDAL VALVE CO LTD|IBF)$/i', $line)) {
+                $companyParts = [$line];
+
+                // Check if next line is "REF" (standalone) and skip it
+                if (isset($blockLines[$i + 1]) && trim($blockLines[$i + 1]) === 'REF') {
+                    $i++; // Skip the standalone REF line
+                }
+
+                // Check if next line is C/O pattern
+                if (isset($blockLines[$i + 1]) && preg_match('/^C\/O\s+(.+)$/i', trim($blockLines[$i + 1]), $m)) {
+                    $companyParts[] = '(' . trim($blockLines[$i + 1]) . ')';
+                    $i++; // Skip the C/O line as we've processed it
+                }
+
+                $company = implode(' ', $companyParts);
+                Log::info("Built company from multiple lines: '{$company}'");
+                continue;
+            }
+        }
+
+        // Separate pass to extract date and time - look for them in the section
+        foreach ($blockLines as $lineIndex => $line) {
+            Log::info("Checking for date/time in line {$lineIndex}: '{$line}'");
+
+            // Extract date: DD/MM/YYYY
+            if (!$dateFound && preg_match('/(\d{2}\/\d{2}\/\d{4})/', $line, $m)) {
+                $dateFound = $m[1];
+                Log::info("Found date in section: {$dateFound}");
+            }
+
+            // Extract time with enhanced patterns for PM/AM
+            if (!$timeFound) {
+                // HHMM-HamPM format (like 0900-2pm, 0900-3PM)
+                if (preg_match('/(\d{2})(\d{2})\s*[-–]\s*(\d{1,2})\s*(pm|am)/i', $line, $m)) {
+                    $startHour = (int)$m[1];
+                    $startMin = (int)$m[2];
+                    $endHour = (int)$m[3];
+                    $endAmPm = strtolower($m[4]);
+
+                    // Convert PM/AM to 24-hour format
+                    if ($endAmPm === 'pm' && $endHour < 12) {
+                        $endHour += 12;
+                    } elseif ($endAmPm === 'am' && $endHour === 12) {
+                        $endHour = 0;
+                    }
+
+                    $timeFound = [
+                        'start' => sprintf('%02d:%02d', $startHour, $startMin),
+                        'end' => sprintf('%02d:%02d', $endHour, 0)
+                    ];
+                    Log::info("Found time range (HHMM-HamPM): {$timeFound['start']} - {$timeFound['end']}");
+                }
+                // Standard HHMM-HHMM format
+                elseif (preg_match('/(\d{2})(\d{2})\s*[-–]\s*(\d{2})(\d{2})/', $line, $m)) {
+                    $timeFound = [
+                        'start' => sprintf('%02d:%02d', (int)$m[1], (int)$m[2]),
+                        'end' => sprintf('%02d:%02d', (int)$m[3], (int)$m[4])
+                    ];
+                    Log::info("Found time range (HHMM-HHMM): {$timeFound['start']} - {$timeFound['end']}");
+                }
+            }
+        }
+
+        // Build time object if we have both date and time
+        if ($dateFound && $timeFound) {
+            try {
+                $carbonDate = Carbon::createFromFormat('d/m/Y', $dateFound);
+                $timeObj = [
+                    'datetime_from' => $carbonDate->copy()->setTimeFromTimeString($timeFound['start'])->format('c'),
+                    'datetime_to' => $carbonDate->copy()->setTimeFromTimeString($timeFound['end'])->format('c')
+                ];
+                Log::info("Built time object from section: " . json_encode($timeObj));
+            } catch (\Exception $e) {
+                Log::error("Error building time object: " . $e->getMessage());
+            }
+        }
+
+        foreach ($blockLines as $lineIndex => $line) {
+            Log::info("Processing detail line {$lineIndex}: '{$line}'");
+
+            // Skip lines we've already processed in company extraction
+            if (!empty($company) && (
+                preg_match('/^(AKZO NOBEL|EPAC FULFILMENT SOLUTIONS LTD|LINDAL VALVE CO LTD|IBF)$/i', $line) ||
+                trim($line) === 'REF' ||
+                preg_match('/^C\/O\s+/i', $line)
+            )) {
+                Log::info("Skipping already processed line: '{$line}'");
+                continue;
+            }
+
+            // Extract company name if not already found (fallback)
+            if (empty($company)) {
+                $extractedCompany = $this->extractCompanyName($line);
+                if ($extractedCompany) {
+                    $company = $extractedCompany;
+                    Log::info("Extracted company: '{$company}'");
+                    continue;
+                }
+            }
+
+            // Extract REF comment - look for "REF XXXXX" pattern
+            if (empty($refComment) && preg_match('/^REF\s+([A-Z0-9\/\-]+)$/i', $line, $m)) {
+                $refComment = $m[1];
+                Log::info("Found REF: {$refComment}");
+                continue;
+            }
+            // Also check for patterns like "PICK UP T1"
+            elseif (empty($refComment) && preg_match('/(PICK\s+UP\s+[A-Z0-9]+)/i', $line, $m)) {
+                $refComment = $m[1];
+                Log::info("Found pickup comment: {$refComment}");
+                continue;
+            }
+
+            // Skip lines that look like headers or section markers
+            if (preg_match('/^(Collection|Delivery)\s/i', $line)) {
+                Log::info("Skipping header line: '{$line}'");
+                continue;
+            }
+
+            // Skip standalone REF lines (but not "REF XXXXX")
+            if (trim($line) === 'REF') {
+                Log::info("Skipping standalone REF line: '{$line}'");
+                continue;
+            }
+
+            // Parse address components
+            Log::info("Attempting to parse address from: '{$line}'");
+            $this->parseAddressComponents($line, $address);
+        }
+
+        // Ensure we have a company name
+        if (empty($company)) {
+            $company = ucfirst($type) . ' Location';
+            Log::info("Using fallback company name: {$company}");
+        }
+
+        // Build the final address
+        $finalAddress = [
+            'company' => $company,
+            'street_address' => $address['street_address'] ?: 'TBC',
+            'city' => $address['city'] ?: 'Unknown',
+            'postal_code' => $address['postal_code'] ?: 'TBC',
+            'country_code' => $address['country_code']
+        ];
+
+        // Add REF comment if found
+        if ($refComment) {
+            if (preg_match('/^PICK\s+UP/i', $refComment)) {
+                $finalAddress['comment'] = $refComment;
+            } else {
+                // Extract just the company name without C/O for the comment
+                $companyForComment = preg_replace('/\s*\([^)]+\)$/', '', $company);
+                $finalAddress['comment'] = $companyForComment . ' REF ' . $refComment;
+            }
+        }
+
+        $result = ['company_address' => $finalAddress];
+
+        // Add time interval if found (renamed from 'time' to 'time_interval')
+        if ($timeObj) {
+            $result['time_interval'] = $timeObj;
+        }
+
+        Log::info("=== FINAL LOCATION RESULT ===");
+        Log::info(json_encode($result, JSON_PRETTY_PRINT));
+
+        return $result;
+    }
+
     protected function areLocationsDuplicate(array $location1, array $location2): bool
     {
         $addr1 = $location1['company_address'];
@@ -1020,7 +1302,6 @@ class ZieglerPdfAssistant extends PdfClient
         $firstLine = $blockLines[0];
 
         // Multiple patterns to extract company name
-
         if (preg_match('/^(Collection|Delivery)\s+(.+?)(?:\s+REF)?$/i', $firstLine, $m)) {
             $company = trim($m[2]);
             $company = preg_replace('/\s+REF\s*$/i', '', $company);
@@ -1071,8 +1352,25 @@ class ZieglerPdfAssistant extends PdfClient
                 Log::info("Found date: {$date}");
             }
 
-            // Extract time ranges: various formats
-            if (preg_match('/(\d{2}):?(\d{2})\s*[-–]\s*(\d{2}):?(\d{2})/', $line, $m)) {
+            // Extract time ranges: various formats including PM/AM
+            if (preg_match('/(\d{2})(\d{2})\s*[-–]\s*(\d{1,2})\s*(pm|am)/i', $line, $m)) {
+                $startHour = (int)$m[1];
+                $startMin = (int)$m[2];
+                $endHour = (int)$m[3];
+                $endAmPm = strtolower($m[4]);
+
+                // Convert PM/AM to 24-hour format
+                if ($endAmPm === 'pm' && $endHour < 12) {
+                    $endHour += 12;
+                } elseif ($endAmPm === 'am' && $endHour === 12) {
+                    $endHour = 0;
+                }
+
+                $timeStart = sprintf('%02d:%02d', $startHour, $startMin);
+                $timeEnd = sprintf('%02d:%02d', $endHour, 0);
+                Log::info("Found time range (with PM/AM): {$timeStart} - {$timeEnd}");
+            }
+            elseif (preg_match('/(\d{2}):?(\d{2})\s*[-–]\s*(\d{2}):?(\d{2})/', $line, $m)) {
                 $timeStart = sprintf('%02d:%02d', (int)$m[1], (int)$m[2]);
                 $timeEnd = sprintf('%02d:%02d', (int)$m[3], (int)$m[4]);
                 Log::info("Found time range: {$timeStart} - {$timeEnd}");
@@ -1129,7 +1427,7 @@ class ZieglerPdfAssistant extends PdfClient
 
         $result = ['company_address' => $cleanAddress];
         if ($timeObj) {
-            $result['time'] = $timeObj;
+            $result['time_interval'] = $timeObj; // Use time_interval for delivery locations too
         }
 
         Log::info("Final location result: " . json_encode($result));
@@ -1249,146 +1547,6 @@ class ZieglerPdfAssistant extends PdfClient
         return collect($parts)->filter()->implode('. ') . (count($parts) ? '.' : '');
     }
 
-    protected function parseLocationDetails(array $blockLines, string $type): ?array
-    {
-        Log::info("=== PARSING LOCATION DETAILS FOR " . strtoupper($type) . " ===");
-        Log::info("Block lines: " . json_encode($blockLines));
-
-        $company = '';
-        $refComment = '';
-        $address = [
-            'street_address' => '',
-            'city' => '',
-            'postal_code' => '',
-            'country_code' => 'GB'
-        ];
-        $timeObj = null;
-
-        // Enhanced company extraction for multi-line format
-        for ($i = 0; $i < count($blockLines); $i++) {
-            $line = trim($blockLines[$i]);
-
-            // Look for company name patterns
-            if (empty($company) && preg_match('/^(AKZO NOBEL|EPAC FULFILMENT SOLUTIONS LTD|LINDAL VALVE CO LTD|IBF)$/i', $line)) {
-                $companyParts = [$line];
-
-                // Check if next line is "REF" (standalone) and skip it
-                if (isset($blockLines[$i + 1]) && trim($blockLines[$i + 1]) === 'REF') {
-                    $i++; // Skip the standalone REF line
-                }
-
-                // Check if next line is C/O pattern
-                if (isset($blockLines[$i + 1]) && preg_match('/^C\/O\s+(.+)$/i', trim($blockLines[$i + 1]), $m)) {
-                    $companyParts[] = '(' . trim($blockLines[$i + 1]) . ')';
-                    $i++; // Skip the C/O line as we've processed it
-                }
-
-                $company = implode(' ', $companyParts);
-                Log::info("Built company from multiple lines: '{$company}'");
-                continue;
-            }
-        }
-
-        foreach ($blockLines as $lineIndex => $line) {
-            Log::info("Processing detail line {$lineIndex}: '{$line}'");
-
-            // Skip lines we've already processed in company extraction
-            if (!empty($company) && (
-                preg_match('/^(AKZO NOBEL|EPAC FULFILMENT SOLUTIONS LTD|LINDAL VALVE CO LTD|IBF)$/i', $line) ||
-                trim($line) === 'REF' ||
-                preg_match('/^C\/O\s+/i', $line)
-            )) {
-                Log::info("Skipping already processed line: '{$line}'");
-                continue;
-            }
-
-            // Extract company name if not already found (fallback)
-            if (empty($company)) {
-                $extractedCompany = $this->extractCompanyName($line);
-                if ($extractedCompany) {
-                    $company = $extractedCompany;
-                    Log::info("Extracted company: '{$company}'");
-                    continue;
-                }
-            }
-
-            // Extract REF comment - look for "REF XXXXX" pattern
-            if (empty($refComment) && preg_match('/^REF\s+([A-Z0-9\/\-]+)$/i', $line, $m)) {
-                $refComment = $m[1];
-                Log::info("Found REF: {$refComment}");
-                continue;
-            }
-            // Also check for patterns like "PICK UP T1"
-            elseif (empty($refComment) && preg_match('/(PICK\s+UP\s+[A-Z0-9]+)/i', $line, $m)) {
-                $refComment = $m[1];
-                Log::info("Found pickup comment: {$refComment}");
-                continue;
-            }
-
-            // Extract time information
-            $timeData = $this->extractTimeFromLine($line);
-            if ($timeData) {
-                $timeObj = $timeData;
-                Log::info("Found time: " . json_encode($timeObj));
-                continue;
-            }
-
-            // Skip lines that look like headers or section markers
-            if (preg_match('/^(Collection|Delivery)\s/i', $line)) {
-                Log::info("Skipping header line: '{$line}'");
-                continue;
-            }
-
-            // Skip standalone REF lines (but not "REF XXXXX")
-            if (trim($line) === 'REF') {
-                Log::info("Skipping standalone REF line: '{$line}'");
-                continue;
-            }
-
-            // Parse address components
-            Log::info("Attempting to parse address from: '{$line}'");
-            $this->parseAddressComponents($line, $address);
-        }
-
-        // Ensure we have a company name
-        if (empty($company)) {
-            $company = ucfirst($type) . ' Location';
-            Log::info("Using fallback company name: {$company}");
-        }
-
-        // Build the final address
-        $finalAddress = [
-            'company' => $company,
-            'street_address' => $address['street_address'] ?: 'TBC',
-            'city' => $address['city'] ?: 'Unknown',
-            'postal_code' => $address['postal_code'] ?: 'TBC',
-            'country_code' => $address['country_code']
-        ];
-
-        // Add REF comment if found
-        if ($refComment) {
-            if (preg_match('/^PICK\s+UP/i', $refComment)) {
-                $finalAddress['comment'] = $refComment;
-            } else {
-                // Extract just the company name without C/O for the comment
-                $companyForComment = preg_replace('/\s*\([^)]+\)$/', '', $company);
-                $finalAddress['comment'] = $companyForComment . ' REF ' . $refComment;
-            }
-        }
-
-        $result = ['company_address' => $finalAddress];
-
-        // Add time if found
-        if ($timeObj) {
-            $result['time'] = $timeObj;
-        }
-
-        Log::info("=== FINAL LOCATION RESULT ===");
-        Log::info(json_encode($result, JSON_PRETTY_PRINT));
-
-        return $result;
-    }
-
     protected function extractCompanyName(string $line): string
     {
         Log::info("Extracting company from: '{$line}'");
@@ -1442,46 +1600,5 @@ class ZieglerPdfAssistant extends PdfClient
 
         Log::info("No company name found in line");
         return '';
-    }
-
-    protected function extractTimeFromLine(string $line): ?array
-    {
-        $date = null;
-        $timeStart = null;
-        $timeEnd = null;
-
-        // Extract date: DD/MM/YYYY
-        if (preg_match('/(\d{2}\/\d{2}\/\d{4})/', $line, $m)) {
-            $date = $m[1];
-            Log::info("Found date in line: {$date}");
-        }
-
-        // Extract time ranges: HHMM-HHMM format (like 0900-1400)
-        if (preg_match('/(\d{2})(\d{2})\s*[-–]\s*(\d{2})(\d{2})/', $line, $m)) {
-            $timeStart = sprintf('%02d:%02d', (int)$m[1], (int)$m[2]);
-            $timeEnd = sprintf('%02d:%02d', (int)$m[3], (int)$m[4]);
-            Log::info("Found time range in line: {$timeStart} - {$timeEnd}");
-        }
-        // Also try HH:MM-HH:MM format
-        elseif (preg_match('/(\d{2}):(\d{2})\s*[-–]\s*(\d{2}):(\d{2})/', $line, $m)) {
-            $timeStart = sprintf('%02d:%02d', (int)$m[1], (int)$m[2]);
-            $timeEnd = sprintf('%02d:%02d', (int)$m[3], (int)$m[4]);
-            Log::info("Found time range in line: {$timeStart} - {$timeEnd}");
-        }
-
-        // Build time object if we have all components
-        if ($date && $timeStart && $timeEnd) {
-            try {
-                $carbonDate = Carbon::createFromFormat('d/m/Y', $date);
-                return [
-                    'datetime_from' => $carbonDate->copy()->setTimeFromTimeString($timeStart)->format('c'),
-                    'datetime_to' => $carbonDate->copy()->setTimeFromTimeString($timeEnd)->format('c')
-                ];
-            } catch (\Exception $e) {
-                Log::error("Error building time object: " . $e->getMessage());
-            }
-        }
-
-        return null;
     }
 }
