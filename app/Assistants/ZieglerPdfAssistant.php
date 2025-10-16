@@ -921,28 +921,132 @@ class ZieglerPdfAssistant extends PdfClient
 
     protected function extractCargos(array $lines): array
     {
-        $cargos = [];
+        Log::info("=== EXTRACTING CARGOS WITH COLLECTION/DELIVERY FLOW MATCHING ===");
 
-        foreach ($lines as $line) {
-            // Look for pallet counts
-            if (preg_match('/(\d+)\s+(?:PALLETS?|PALLET)/i', $line, $m)) {
-                $cargos[] = [
-                    'title' => 'Palletized goods',
-                    'package_count' => (int) $m[1],
-                    'package_type' => 'pallet'
-                ];
-                Log::info("Found cargo: {$m[1]} pallets");
+        $cargos = [];
+        $foundCargoCounts = [];
+
+        // Track cargo by section type and company
+        $currentSection = null;
+        $currentCompany = null;
+
+        for ($i = 0; $i < count($lines); $i++) {
+            $line = trim($lines[$i]);
+
+            // Detect section changes
+            if (preg_match('/^Collection\s+(.+)/i', $line, $m)) {
+                $currentSection = 'collection';
+                $currentCompany = trim($m[1]);
+                Log::info("Found Collection section: {$currentCompany}");
+                continue;
             }
-            // Look for other package types
-            elseif (preg_match('/(\d+)\s+(PACKAGES?|CARTONS?|BOXES?|ITEMS?)/i', $line, $m)) {
-                $cargos[] = [
-                    'title' => 'Packaged goods',
-                    'package_count' => (int) $m[1],
-                    'package_type' => 'package'
-                ];
-                Log::info("Found cargo: {$m[1]} {$m[2]}");
+
+            if (preg_match('/^Collection$/i', $line)) {
+                $currentSection = 'collection';
+                $currentCompany = null;
+                continue;
+            }
+
+            if (preg_match('/^Delivery/i', $line)) {
+                $currentSection = 'delivery';
+                $currentCompany = null;
+                continue;
+            }
+
+            // Set company if we're in a section but don't have one yet
+            if ($currentSection && !$currentCompany) {
+                if (preg_match('/^(AKZO NOBEL|EPAC FULFILMENT SOLUTIONS LTD|LINDAL VALVE CO LTD|IBF|ICD8)$/i', $line)) {
+                    $currentCompany = trim($line);
+                    Log::info("Found company in {$currentSection} section: {$currentCompany}");
+                    continue;
+                }
+            }
+
+            // Look for cargo counts in collection sections only
+            if ($currentSection === 'collection' && $currentCompany) {
+                if (preg_match('/(\d+)\s+(?:PALLETS?|PALLET)/i', $line, $m)) {
+                    $palletCount = (int) $m[1];
+
+                    // Create unique identifier for this cargo load
+                    $cargoKey = $palletCount . '_pallets';
+
+                    // Only add if we haven't seen this exact count before
+                    if (!isset($foundCargoCounts[$cargoKey])) {
+                        $loadNumber = count($cargos) + 1;
+                        $cargos[] = [
+                            'title' => "Mixed Pallet Load {$loadNumber}",
+                            'package_count' => $palletCount,
+                            'package_type' => 'pallet',
+                            'type' => 'FTL'
+                        ];
+                        $foundCargoCounts[$cargoKey] = true;
+                        Log::info("Added cargo load {$loadNumber}: {$palletCount} pallets from {$currentCompany}");
+                    } else {
+                        Log::info("Skipping duplicate cargo count: {$palletCount} pallets");
+                    }
+                }
+                elseif (preg_match('/(\d+)\s+(PACKAGES?|CARTONS?|BOXES?|ITEMS?)/i', $line, $m)) {
+                    $packageCount = (int) $m[1];
+                    $packageType = strtolower(rtrim($m[2], 's')); // Remove plural 's'
+
+                    $cargoKey = $packageCount . '_' . $packageType;
+
+                    if (!isset($foundCargoCounts[$cargoKey])) {
+                        $loadNumber = count($cargos) + 1;
+                        $cargos[] = [
+                            'title' => "Mixed Package Load {$loadNumber}",
+                            'package_count' => $packageCount,
+                            'package_type' => $packageType,
+                            'type' => 'FTL'
+                        ];
+                        $foundCargoCounts[$cargoKey] = true;
+                        Log::info("Added cargo load {$loadNumber}: {$packageCount} {$packageType}s from {$currentCompany}");
+                    }
+                }
             }
         }
+
+        // Fallback: if no collection-based cargos found, use simple extraction
+        if (empty($cargos)) {
+            Log::info("No collection-based cargos found, using simple extraction");
+
+            $seenCounts = [];
+
+            foreach ($lines as $line) {
+                if (preg_match('/(\d+)\s+(?:PALLETS?|PALLET)/i', $line, $m)) {
+                    $count = (int) $m[1];
+
+                    if (!in_array($count, $seenCounts)) {
+                        $loadNumber = count($cargos) + 1;
+                        $cargos[] = [
+                            'title' => "Mixed Pallet Load {$loadNumber}",
+                            'package_count' => $count,
+                            'package_type' => 'pallet',
+                            'type' => 'FTL'
+                        ];
+                        $seenCounts[] = $count;
+                        Log::info("Added unique cargo: {$count} pallets");
+                    }
+                }
+                elseif (preg_match('/(\d+)\s+(PACKAGES?|CARTONS?|BOXES?|ITEMS?)/i', $line, $m)) {
+                    $count = (int) $m[1];
+
+                    if (!in_array($count, $seenCounts)) {
+                        $loadNumber = count($cargos) + 1;
+                        $cargos[] = [
+                            'title' => "Mixed Package Load {$loadNumber}",
+                            'package_count' => $count,
+                            'package_type' => 'package',
+                            'type' => 'FTL'
+                        ];
+                        $seenCounts[] = $count;
+                    }
+                }
+            }
+        }
+
+        Log::info("Final extracted cargos: " . json_encode($cargos));
+        Log::info("=== CARGO EXTRACTION COMPLETE ===");
 
         return $cargos;
     }
