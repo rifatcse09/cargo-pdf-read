@@ -27,6 +27,7 @@ class ZieglerPdfAssistant extends PdfClient
             ->filter(fn($l) => !empty($l))
             ->values()
             ->toArray();
+            //dd( $lines);
 
         // Extract all components
         $customer = $this->extractCustomer($lines);
@@ -244,9 +245,17 @@ class ZieglerPdfAssistant extends PdfClient
         $foundReferences = [];
 
         foreach ($lines as $i => $line) {
-            // "Ziegler Ref 187395" - highest priority
-            if (preg_match('/Ziegler\s+Ref\s+(\w+)/i', $line, $m)) {
+            // "Ziegler Ref XXXXX" - highest priority - capture any reference dynamically
+            if (preg_match('/Ziegler\s+Ref\s+([A-Z0-9\/\-]+)/i', $line, $m)) {
                 $foundReferences[] = ['priority' => 1, 'ref' => $m[1], 'line' => $i, 'pattern' => 'Ziegler Ref'];
+            }
+
+            // "Ziegler Ref" in current line, reference number in next line
+            if (preg_match('/^Ziegler\s+Ref$/i', trim($line)) && isset($lines[$i + 1])) {
+                $nextLine = trim($lines[$i + 1]);
+                if (preg_match('/^([A-Z0-9\/\-]+)$/i', $nextLine, $m)) {
+                    $foundReferences[] = ['priority' => 1, 'ref' => $m[1], 'line' => $i, 'pattern' => 'Ziegler Ref (next line)'];
+                }
             }
 
             // "Our Ref: XXXXXXX" - high priority
@@ -257,15 +266,6 @@ class ZieglerPdfAssistant extends PdfClient
             // "Ref: XXXXXXX" at start of line - medium priority
             if (preg_match('/^Ref(?:erence)?[:\s]+([A-Z0-9\-\/]+)/i', $line, $m)) {
                 $foundReferences[] = ['priority' => 3, 'ref' => trim($m[1]), 'line' => $i, 'pattern' => 'Line Ref'];
-            }
-
-            // Look for specific known references
-            if (preg_match('/\b(187395)\b/', $line, $m)) {
-                $foundReferences[] = ['priority' => 1, 'ref' => $m[1], 'line' => $i, 'pattern' => 'Specific 187395'];
-            }
-
-            if (preg_match('/\b(98111001678)\b/', $line, $m)) {
-                $foundReferences[] = ['priority' => 1, 'ref' => $m[1], 'line' => $i, 'pattern' => 'Specific 98111001678'];
             }
 
             // Generic "Ref" followed by alphanumeric - lower priority
