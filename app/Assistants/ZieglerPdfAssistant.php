@@ -432,6 +432,62 @@ class ZieglerPdfAssistant extends PdfClient
         ];
     }
 
+    protected function parseAddressLine(string $line, array &$address): void
+    {
+        // Street patterns
+        if (preg_match('/^(.+(?:ROAD|RD|STREET|ST|LANE|LN|AVENUE|AVE|DRIVE|DR|UNITS|HALL|WAY|CLOSE|CRESCENT|GROVE|PARK|PLACE|SQUARE|YARD|MEWS|GARDENS|GREEN).*?)(?:\s+[A-Z]{1,2}\d+|$)/i', $line, $m)) {
+            if (empty($address['street_address'])) {
+                $address['street_address'] = trim($m[1]);
+                Log::info("Found street: {$address['street_address']}");
+            }
+        }
+
+        // UK postcode + city pattern: "IP14 2QU STOWMARKET"
+        if (preg_match('/([A-Z]{1,2}\d+\s+\d[A-Z]{2})\s+([A-Z\s]+)$/i', $line, $m)) {
+            $address['postal_code'] = $m[1];
+            $address['city'] = trim($m[2]);
+            $address['country_code'] = 'GB';
+            Log::info("Found UK postcode+city: {$address['postal_code']} {$address['city']}");
+            return;
+        }
+
+        // French postcode + city: "95150 TAVERNY"
+        if (preg_match('/^(\d{5})\s+([A-Z\s]+)$/i', $line, $m)) {
+            $address['postal_code'] = $m[1];
+            $address['city'] = trim($m[2]);
+            $address['country_code'] = 'FR';
+            Log::info("Found French postcode+city: {$address['postal_code']} {$address['city']}");
+            return;
+        }
+
+        // Standalone UK postcode
+        if (preg_match('/\b([A-Z]{1,2}\d+\s*\d[A-Z]{2})\b/', $line, $m)) {
+            if (empty($address['postal_code'])) {
+                $pc = strtoupper(str_replace(' ', '', $m[1]));
+                $address['postal_code'] = substr($pc, 0, -3) . ' ' . substr($pc, -3);
+                $address['country_code'] = 'GB';
+                Log::info("Found standalone UK postcode: {$address['postal_code']}");
+            }
+        }
+
+        // Standalone French postcode
+        if (preg_match('/\b(\d{5})\b/', $line, $m)) {
+            if (empty($address['postal_code'])) {
+                $address['postal_code'] = $m[1];
+                $address['country_code'] = 'FR';
+                Log::info("Found standalone French postcode: {$address['postal_code']}");
+            }
+        }
+
+        // City (all caps, no digits, reasonable length)
+        if (preg_match('/^([A-Z\s\'-]{3,30})$/i', $line) && !preg_match('/\d/', $line)) {
+            if (empty($address['city'])) {
+                $address['city'] = trim($line);
+                Log::info("Found standalone city: {$address['city']}");
+            }
+        }
+    }
+
     protected function findCollectionSectionStarts(array $lines): array
     {
         $starts = [];
@@ -1192,9 +1248,9 @@ class ZieglerPdfAssistant extends PdfClient
 
         $result = ['company_address' => $finalAddress];
 
-        // Add time interval if found (renamed from 'time' to 'time_interval')
+        // Add time if found
         if ($timeObj) {
-            $result['time_interval'] = $timeObj;
+            $result['time'] = $timeObj;
         }
 
         Log::info("=== FINAL LOCATION RESULT ===");
@@ -1427,67 +1483,11 @@ class ZieglerPdfAssistant extends PdfClient
 
         $result = ['company_address' => $cleanAddress];
         if ($timeObj) {
-            $result['time_interval'] = $timeObj; // Use time_interval for delivery locations too
+            $result['time'] = $timeObj; // Use 'time' instead of 'time_interval'
         }
 
         Log::info("Final location result: " . json_encode($result));
         return $result;
-    }
-
-    protected function parseAddressLine(string $line, array &$address): void
-    {
-        // Street patterns
-        if (preg_match('/^(.+(?:ROAD|RD|STREET|ST|LANE|LN|AVENUE|AVE|DRIVE|DR|UNITS|HALL|WAY|CLOSE|CRESCENT|GROVE|PARK|PLACE|SQUARE|YARD|MEWS|GARDENS|GREEN).*?)(?:\s+[A-Z]{1,2}\d+|$)/i', $line, $m)) {
-            if (empty($address['street_address'])) {
-                $address['street_address'] = trim($m[1]);
-                Log::info("Found street: {$address['street_address']}");
-            }
-        }
-
-        // UK postcode + city pattern: "IP14 2QU STOWMARKET"
-        if (preg_match('/([A-Z]{1,2}\d+\s+\d[A-Z]{2})\s+([A-Z\s]+)$/i', $line, $m)) {
-            $address['postal_code'] = $m[1];
-            $address['city'] = trim($m[2]);
-            $address['country_code'] = 'GB';
-            Log::info("Found UK postcode+city: {$address['postal_code']} {$address['city']}");
-            return;
-        }
-
-        // French postcode + city: "95150 TAVERNY"
-        if (preg_match('/^(\d{5})\s+([A-Z\s]+)$/i', $line, $m)) {
-            $address['postal_code'] = $m[1];
-            $address['city'] = trim($m[2]);
-            $address['country_code'] = 'FR';
-            Log::info("Found French postcode+city: {$address['postal_code']} {$address['city']}");
-            return;
-        }
-
-        // Standalone UK postcode
-        if (preg_match('/\b([A-Z]{1,2}\d+\s*\d[A-Z]{2})\b/', $line, $m)) {
-            if (empty($address['postal_code'])) {
-                $pc = strtoupper(str_replace(' ', '', $m[1]));
-                $address['postal_code'] = substr($pc, 0, -3) . ' ' . substr($pc, -3);
-                $address['country_code'] = 'GB';
-                Log::info("Found standalone UK postcode: {$address['postal_code']}");
-            }
-        }
-
-        // Standalone French postcode
-        if (preg_match('/\b(\d{5})\b/', $line, $m)) {
-            if (empty($address['postal_code'])) {
-                $address['postal_code'] = $m[1];
-                $address['country_code'] = 'FR';
-                Log::info("Found standalone French postcode: {$address['postal_code']}");
-            }
-        }
-
-        // City (all caps, no digits, reasonable length)
-        if (preg_match('/^([A-Z\s\'-]{3,30})$/i', $line) && !preg_match('/\d/', $line)) {
-            if (empty($address['city'])) {
-                $address['city'] = trim($line);
-                Log::info("Found standalone city: {$address['city']}");
-            }
-        }
     }
 
     protected function extractCargos(array $lines): array
