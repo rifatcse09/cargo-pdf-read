@@ -23,15 +23,6 @@ class ZieglerPdfAssistant extends PdfClient
     public function processLines(array $lines, ?string $attachment_filename = null)
     {
 
-        // Debug: log ALL lines to understand the actual structure
-        Log::info("=== COMPLETE ZIEGLER PDF STRUCTURE ===");
-        foreach ($lines as $i => $line) {
-            $trimmed = trim($line);
-            if (!empty($trimmed)) {
-                Log::info("Line {$i}: '{$trimmed}'");
-            }
-        }
-
         // Clean and normalize lines
         $lines = collect($lines)
             ->map(fn($l) => trim(preg_replace('/\s+/', ' ', $l)))
@@ -47,11 +38,6 @@ class ZieglerPdfAssistant extends PdfClient
         $destLocs = $this->extractDestinationLocations($lines);
         $cargos = $this->extractCargos($lines);
         $comment = $this->extractComment($lines);
-
-        // Debug extracted data
-        Log::info("Extracted loading locations: " . json_encode($loadingLocs));
-        Log::info("Extracted destination locations: " . json_encode($destLocs));
-        Log::info("Extracted cargos: " . json_encode($cargos));
 
         // Ensure we have proper fallback locations if none found
         if (empty($loadingLocs)) {
@@ -151,18 +137,12 @@ class ZieglerPdfAssistant extends PdfClient
         $cityFound = false;
         $postalCodeFound = false;
 
-        Log::info("=== PARSING ZIEGLER ADDRESS ===");
-        Log::info("Address lines to process: " . json_encode($addressLines));
-
         foreach ($addressLines as $lineIndex => $line) {
             $line = trim($line);
             if (empty($line)) break;
 
-            Log::info("Processing Ziegler address line {$lineIndex}: '{$line}'");
-
             // Stop at booking/instruction lines
             if (preg_match('/\b(BOOKING|INSTRUCTION|TELEPHONE|REF)\b/i', $line)) {
-                Log::info("Stopping at booking/instruction line: '{$line}'");
                 break;
             }
 
@@ -183,7 +163,6 @@ class ZieglerPdfAssistant extends PdfClient
                 } else {
                     $details['country_code'] = 'GB';
                 }
-                Log::info("Found postal code: {$details['postal_code']}");
                 continue;
             }
 
@@ -202,7 +181,6 @@ class ZieglerPdfAssistant extends PdfClient
                 } else {
                     $details['country_code'] = 'FR';
                 }
-                Log::info("Found French postal code: {$details['postal_code']}");
                 continue;
             }
 
@@ -233,7 +211,6 @@ class ZieglerPdfAssistant extends PdfClient
                 if ($isLikelyCity) {
                     $details['city'] = $line;
                     $cityFound = true;
-                    Log::info("Found city: {$details['city']}");
                     continue;
                 }
             }
@@ -243,17 +220,11 @@ class ZieglerPdfAssistant extends PdfClient
             $streetParts[] = $line;
         }
 
-        Log::info("Street parts collected: " . json_encode($streetParts));
-        Log::info("City found: " . ($cityFound ? $details['city'] ?? 'none' : 'none'));
-        Log::info("Postal code found: " . ($postalCodeFound ? $details['postal_code'] ?? 'none' : 'none'));
-
         // Build the complete street address
         if (!empty($streetParts)) {
             $details['street_address'] = collect($streetParts)->implode(', ');
-            Log::info("Final street address: {$details['street_address']}");
         }
 
-        Log::info("=== ZIEGLER ADDRESS PARSING COMPLETE ===");
     }
 
     protected function findZieglerTerms(array $lines): ?string
@@ -334,11 +305,6 @@ class ZieglerPdfAssistant extends PdfClient
             return $a['priority'] <=> $b['priority'];
         });
 
-        // Log all found references for debugging
-        foreach ($foundReferences as $ref) {
-            Log::info("Found reference: {$ref['ref']} (priority: {$ref['priority']}, pattern: {$ref['pattern']}, line: {$ref['line']})");
-        }
-
         // Return the highest priority reference
         if (!empty($foundReferences)) {
             $bestRef = $foundReferences[0]['ref'];
@@ -346,7 +312,6 @@ class ZieglerPdfAssistant extends PdfClient
             return $bestRef;
         }
 
-        Log::info("No order reference found");
         return null;
     }
 
@@ -356,7 +321,6 @@ class ZieglerPdfAssistant extends PdfClient
         $currency = null;
 
         foreach ($lines as $line) {
-            Log::info("Checking freight line: {$line}");
 
             // "Rate € 1,000" or "Rate € 1.15" - more flexible pattern
             if (preg_match('/Rate\s*€\s*([0-9,.\s]+)/i', $line, $m)) {
@@ -372,7 +336,6 @@ class ZieglerPdfAssistant extends PdfClient
                 $cleanPrice = function_exists('uncomma') ? uncomma($m[1]) : str_replace([',', ' '], '', $m[1]);
                 $price = (float) $cleanPrice;
                 $currency = 'EUR';
-                Log::info("Found € pattern: original='{$m[1]}', cleaned='{$cleanPrice}', final={$price}");
                 break;
             }
 
@@ -381,7 +344,6 @@ class ZieglerPdfAssistant extends PdfClient
                 $cleanPrice = function_exists('uncomma') ? uncomma($m[1]) : str_replace([',', ' '], '', $m[1]);
                 $price = (float) $cleanPrice;
                 $currency = 'EUR';
-                Log::info("Found amount € pattern: original='{$m[1]}', cleaned='{$cleanPrice}', final={$price}");
                 break;
             }
 
@@ -390,7 +352,6 @@ class ZieglerPdfAssistant extends PdfClient
                 $cleanPrice = function_exists('uncomma') ? uncomma($m[1]) : str_replace([',', ' '], '', $m[1]);
                 $price = (float) $cleanPrice;
                 $currency = 'EUR';
-                Log::info("Found Price EUR pattern: original='{$m[1]}', cleaned='{$cleanPrice}', final={$price}");
                 break;
             }
 
@@ -399,7 +360,6 @@ class ZieglerPdfAssistant extends PdfClient
                 $currency = strtoupper($m[1]);
                 $cleanPrice = function_exists('uncomma') ? uncomma($m[2]) : str_replace([',', ' '], '', $m[2]);
                 $price = (float) $cleanPrice;
-                Log::info("Found {$currency} pattern: original='{$m[2]}', cleaned='{$cleanPrice}', final={$price}");
                 break;
             }
 
@@ -407,7 +367,6 @@ class ZieglerPdfAssistant extends PdfClient
                 $currency = ['€' => 'EUR', '£' => 'GBP', '$' => 'USD'][$m[1]] ?? null;
                 $cleanPrice = function_exists('uncomma') ? uncomma($m[2]) : str_replace([',', ' '], '', $m[2]);
                 $price = (float) $cleanPrice;
-                Log::info("Found symbol {$m[1]} pattern: original='{$m[2]}', cleaned='{$cleanPrice}', final={$price}");
                 if ($currency) break;
             }
 
@@ -422,8 +381,6 @@ class ZieglerPdfAssistant extends PdfClient
                 $currency = 'GBP';
             }
         }
-
-        Log::info("Final freight result: price={$price}, currency={$currency}");
 
         // Default to EUR if no currency found (common for Ziegler)
         return [
@@ -640,22 +597,26 @@ class ZieglerPdfAssistant extends PdfClient
 
             // Check if this line has a street suffix
             $hasStreetSuffix = false;
+            $currentSuffix = '';
             foreach ($streetSuffixes as $suffix) {
                 if (strpos(strtoupper($currentLine), $suffix) !== false) {
                     $hasStreetSuffix = true;
+                    $currentSuffix = $suffix;
                     break;
                 }
             }
 
             if ($hasStreetSuffix) {
-                Log::info("Line {$i} has street suffix: '{$currentLine}'");
+                Log::info("Line {$i} has street suffix '{$currentSuffix}': '{$currentLine}'");
 
                 // Look ahead for related street parts (skipping cargo/non-address lines)
                 $relatedParts = [$currentLine];
-                $lookAheadDistance = 3; // Look ahead up to 3 lines
+                $lookAheadDistance = 6; // Increased from 3 to 6 to handle more separated addresses
 
                 for ($j = $i + 1; $j <= min($i + $lookAheadDistance, count($blockLines) - 1); $j++) {
                     $nextLine = trim($blockLines[$j]);
+
+                    Log::info("Checking line {$j} for related address part: '{$nextLine}'");
 
                     // Skip cargo lines (like "10 PALLETS")
                     if (preg_match('/^\d+\s+(PALLETS?|PACKAGES?|CARTONS?|BOXES?|ITEMS?)/i', $nextLine)) {
@@ -663,27 +624,43 @@ class ZieglerPdfAssistant extends PdfClient
                         continue;
                     }
 
-                    // Skip date/time lines
-                    if (preg_match('/\d{2}\/\d{2}\/\d{4}|\d{4}-\d{4}|\d{4}-\d+[ap]m/i', $nextLine)) {
+                    // Skip date/time lines (like "0900-1700", "13/06/2025")
+                    if (preg_match('/\d{2}\/\d{2}\/\d{4}|\d{4}-\d{4}|\d{4}-\d+[ap]m|\d{4}-\d{4}/i', $nextLine)) {
                         Log::info("Skipping date/time line {$j}: '{$nextLine}'");
+                        continue;
+                    }
+
+                    // Skip REF lines (like "REF MAX2425")
+                    if (preg_match('/^REF\s+[A-Z0-9\/\-]+$/i', $nextLine)) {
+                        Log::info("Skipping REF line {$j}: '{$nextLine}'");
+                        continue;
+                    }
+
+                    // Skip pickup instruction lines
+                    if (preg_match('/^PICK\s+UP\s+[A-Z0-9]+$/i', $nextLine)) {
+                        Log::info("Skipping pickup instruction line {$j}: '{$nextLine}'");
                         continue;
                     }
 
                     // Check if this next line has a street suffix
                     $nextHasStreetSuffix = false;
+                    $nextSuffix = '';
                     foreach ($streetSuffixes as $suffix) {
                         if (strpos(strtoupper($nextLine), $suffix) !== false) {
                             $nextHasStreetSuffix = true;
+                            $nextSuffix = $suffix;
                             break;
                         }
                     }
 
                     if ($nextHasStreetSuffix) {
-                        Log::info("Found related street part at line {$j}: '{$nextLine}'");
+                        Log::info("Found related street part at line {$j} with suffix '{$nextSuffix}': '{$nextLine}'");
                         $relatedParts[] = $nextLine;
 
                         // Mark this line as processed by setting it to empty
                         $blockLines[$j] = '';
+                    } else {
+                        Log::info("Line {$j} does not have street suffix: '{$nextLine}'");
                     }
                 }
 
@@ -693,11 +670,13 @@ class ZieglerPdfAssistant extends PdfClient
                     Log::info("COMBINED address parts: '{$combinedAddress}'");
                     $combinedLines[] = $combinedAddress;
                 } else {
+                    Log::info("Single address part: '{$currentLine}'");
                     $combinedLines[] = $currentLine;
                 }
             } else {
                 // Not a street line, add as-is (unless it was already processed)
                 if (!empty($currentLine)) {
+                    Log::info("Non-street line: '{$currentLine}'");
                     $combinedLines[] = $currentLine;
                 }
             }
