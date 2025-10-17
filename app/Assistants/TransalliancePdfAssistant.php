@@ -49,6 +49,7 @@ class TransalliancePdfAssistant extends PdfClient
             ->filter(fn($l) => $l !== '')
             ->values()
             ->all();
+            dd($lines);
 
         $orderRef                         = $this->extractOrderRef($lines, $attachment_filename);
         [$freightAmount,$freightCurrency] = $this->extractFreight($lines);
