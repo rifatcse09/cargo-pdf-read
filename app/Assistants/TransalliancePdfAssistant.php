@@ -49,7 +49,6 @@ class TransalliancePdfAssistant extends PdfClient
             ->filter(fn($l) => $l !== '')
             ->values()
             ->all();
-            dd($lines);
 
         $orderRef                         = $this->extractOrderRef($lines, $attachment_filename);
         [$freightAmount,$freightCurrency] = $this->extractFreight($lines);
@@ -83,7 +82,7 @@ class TransalliancePdfAssistant extends PdfClient
             'freight_currency'       => $freightCurrency,
             'loading_locations'      => $loadingStops,
             'destination_locations'  => $deliveryStops,
-            'cargos'                 => filled($cargos) ? $cargos : [['title' => 'PACKAGING']],
+            'cargos'                 => filled($cargos) ? $cargos : [['title' => 'PACKAGING', 'type' => 'FTL']],
             'comment'                => $comment,
         ];
 
@@ -352,44 +351,27 @@ class TransalliancePdfAssistant extends PdfClient
         return sprintf('%s-%02d-%02d', $fullYear, (int)$month, (int)$day);
     }
 
-    /* ===================== Enhanced Cargo Extraction Following Schema ===================== */
+    /* ===================== Enhanced Cargo Extraction for TransAlliance Format ===================== */
 
     protected function extractCargo(array $lines): array
     {
-        // Schema fields to extract
         $title = null;
+        $weight = null;
+        $ldm = null;
+        $type = 'FTL'; // Default for TransAlliance
         $packageCount = null;
         $packageType = null;
-        $number = null;  // tracking/order number
-        $type = null;    // cargo type from schema enum
-        $value = null;   // monetary value
-        $currency = null;
-        $pkgWidth = null;
-        $pkgLength = null;
-        $pkgHeight = null;
-        $ldm = null;
-        $volume = null;
-        $weight = null;
-        $chargeableWeight = null;
-        $tempMin = null;
-        $tempMax = null;
-        $tempMode = null;
-        $adr = null;
-        $extraLift = null;
-        $palletized = null;
-        $manualLoad = null;
-        $vehicleMake = null;
-        $vehicleModel = null;
 
-        // Scan every line for cargo data - first match wins
+        // Look for TransAlliance tabular format patterns
         for ($i = 0; $i < count($lines); $i++) {
             $line = trim($lines[$i]);
             if (empty($line)) continue;
 
             $upper = str($line)->upper()->toString();
 
-            // 1. TITLE extraction - cargo description
+            // 1. TITLE extraction - look for cargo descriptions
             if (!$title) {
+                // Line 66: "PAPER ROLLS" - direct cargo type
                 if (str_contains($upper, 'PAPER ROLLS') || str_contains($upper, 'PAPER ROLL')) {
                     $title = 'PAPER ROLLS';
                 } elseif (preg_match('/\b(STEEL|METAL|IRON|ALUMINUM|ALUMINIUM|COPPER|BRASS)\b/i', $upper)) {
@@ -416,21 +398,75 @@ class TransalliancePdfAssistant extends PdfClient
                     $title = 'PLASTICS';
                 }
 
-                // TransAlliance "M. nature:" pattern
-                if (preg_match('/M\.\s*nature\s*:\s*(.+)/i', $line, $m)) {
-                    $cargoDesc = trim($m[1]);
-                    if (strlen($cargoDesc) > 2 && !preg_match('/^\d+$/', $cargoDesc)) {
-                        $title = strtoupper($cargoDesc);
+                // Check for "M. nature:" field - line after the label
+                if (str_contains($upper, 'M. NATURE:') && $i + 1 < count($lines)) {
+                    $nextLine = trim($lines[$i + 1]);
+                    if (strlen($nextLine) > 2 && !preg_match('/^\d+[,\.]?\d*$/', $nextLine)) {
+                        $title = strtoupper($nextLine);
                     }
-                }
-
-                // Generic fallback
-                if (!$title && preg_match('/\b(GOODS|CARGO|COMMODITY|FREIGHT|MERCHANDISE)\b/i', $upper) && strlen($line) < 30) {
-                    $title = 'GENERAL CARGO';
                 }
             }
 
-            // 2. PACKAGE_COUNT and PACKAGE_TYPE extraction
+            // 2. WEIGHT extraction - TransAlliance format
+            if ($weight === null) {
+                // Line 65: "24000,000" after checking context
+                if (preg_match('/^([0-9]+[,\.][0-9]{1,3})$/', $line)) {
+                    // Check if this appears in the cargo section (after Loading or near weight labels)
+                    $contextStart = max(0, $i - 15);
+                    $contextEnd = min(count($lines) - 1, $i + 5);
+
+                    $inCargoSection = false;
+                    for ($j = $contextStart; $j <= $contextEnd; $j++) {
+                        $contextLine = str($lines[$j])->upper()->toString();
+                        if (str_contains($contextLine, 'LOADING') ||
+                            str_contains($contextLine, 'WEIGHT') ||
+                            str_contains($contextLine, 'KGS') ||
+                            str_contains($contextLine, 'M. NATURE') ||
+                            str_contains($contextLine, 'PAPER ROLLS')) {
+                            $inCargoSection = true;
+                            break;
+                        }
+                    }
+
+                    if ($inCargoSection) {
+                        $candidate = (float) str_replace(',', '.', $line);
+                        // Check if this looks like weight (reasonable cargo weight range)
+                        if ($candidate >= 100 && $candidate <= 50000) {
+                            $weight = $candidate;
+                        }
+                    }
+                }
+
+                // Alternative weight patterns
+                if (preg_match('/\b(?:weight|mass|kgs?)\b[:\s]*([0-9][0-9,\.]*)\s*(?:kg|kgs?|kilos?)?\b/i', $line, $m)) {
+                    $weight = (float) str_replace(',', '.', $m[1]);
+                }
+            }
+
+            // 3. LDM extraction - TransAlliance format
+            if ($ldm === null) {
+                // Line 64: "13,600" - check context for LDM
+                if (preg_match('/^([0-9]+[,\.][0-9]{1,3})$/', $line)) {
+                    $contextStart = max(0, $i - 5);
+                    $inLdmSection = false;
+
+                    for ($j = $contextStart; $j < $i; $j++) {
+                        if (str_contains(str($lines[$j])->upper(), 'LM . . . :')) {
+                            $inLdmSection = true;
+                            break;
+                        }
+                    }
+
+                    if ($inLdmSection) {
+                        $candidate = (float) str_replace(',', '.', $line);
+                        if ($candidate > 0 && $candidate <= 100) { // Reasonable LDM range
+                            $ldm = $candidate;
+                        }
+                    }
+                }
+            }
+
+            // 4. Package information
             if (!$packageCount && preg_match('/\b(\d+)\s*(pallet[s]?|pkg[s]?|package[s]?|unit[s]?|piece[s]?|box[es]?|container[s]?|coli[s]?|carton[s]?)\b/i', $line, $m)) {
                 $packageCount = (int)$m[1];
                 $rawType = strtolower(trim($m[2]));
@@ -444,185 +480,28 @@ class TransalliancePdfAssistant extends PdfClient
                     $packageType = 'other';
                 }
             }
-
-            // 3. TYPE extraction - cargo type enum
-            if (!$type) {
-                if (preg_match('/\b(FTL|FULL\s*TRUCK|FULL\s*LOAD)\b/i', $upper)) {
-                    $type = 'FTL';
-                } elseif (preg_match('/\b(LTL|LESS\s*THAN\s*TRUCK)\b/i', $upper)) {
-                    $type = 'LTL';
-                } elseif (preg_match('/\b(FCL|FULL\s*CONTAINER)\b/i', $upper)) {
-                    $type = 'FCL';
-                } elseif (preg_match('/\b(LCL|LESS\s*THAN\s*CONTAINER)\b/i', $upper)) {
-                    $type = 'LCL';
-                } elseif (preg_match('/\b(PARTIAL|PTL)\b/i', $upper)) {
-                    $type = 'partial';
-                } elseif (preg_match('/\b(CONTAINER)\b/i', $upper)) {
-                    $type = 'container';
-                } elseif (preg_match('/\b(CAR|VEHICLE)\b/i', $upper)) {
-                    $type = 'car';
-                } elseif (preg_match('/\b(AIR|FLIGHT)\b/i', $upper)) {
-                    $type = 'air shipment';
-                } elseif (preg_match('/\b(PARCEL|EXPRESS)\b/i', $upper)) {
-                    $type = 'parcel';
-                }
-            }
-
-            // 4. WEIGHT extraction
-            if ($weight === null) {
-                // TransAlliance format: "24000,000" after weight label
-                if (preg_match('/^([0-9]+[,\.][0-9]{1,3})$/', $line) && $i > 0) {
-                    $prevLine = str($lines[$i-1])->upper();
-                    if (str_contains($prevLine, 'KGS') || str_contains($prevLine, 'WEIGHT') ||
-                        str_contains($prevLine, 'KG') || str_contains($prevLine, 'MASS')) {
-                        $weight = (float) str_replace(',', '.', $line);
-                    }
-                }
-                // Inline weight patterns
-                if (preg_match('/\b(?:weight|mass|kgs?)\b[:\s]*([0-9][0-9,\.]*)\s*(?:kg|kgs?|kilos?)?\b/i', $line, $m)) {
-                    $weight = (float) str_replace(',', '.', $m[1]);
-                }
-                // Standalone weight
-                if (preg_match('/\b([0-9]{4,}[0-9,\.]*)\s*(?:kg|kgs?|kilos?)\b/i', $line, $m)) {
-                    $candidate = (float) str_replace(',', '.', $m[1]);
-                    if ($candidate >= 100) $weight = $candidate;
-                }
-            }
-
-            // 5. LDM extraction
-            if ($ldm === null) {
-                if (preg_match('/^([0-9]+[,\.][0-9]{1,3})$/', $line) && $i > 0) {
-                    $prevLine = str($lines[$i-1])->upper();
-                    if ((str_contains($prevLine, 'LM') || str_contains($prevLine, 'LOADING') ||
-                         str_contains($prevLine, 'METER')) && !str_contains($prevLine, 'KG')) {
-                        $ldm = (float) str_replace(',', '.', $line);
-                    }
-                }
-                if (preg_match('/\b(?:ldm|loading\s*meters?|meters?)\b[:\s]*([0-9][0-9,\.]*)/i', $line, $m)) {
-                    $ldm = (float) str_replace(',', '.', $m[1]);
-                }
-            }
-
-            // 6. VOLUME extraction
-            if ($volume === null && preg_match('/\b([0-9][0-9,\.]*)\s*(?:m3|m³|cbm|cubic\s*meters?)\b/i', $line, $m)) {
-                $volume = (float) str_replace(',', '.', $m[1]);
-            }
-
-            // 7. VALUE and CURRENCY extraction
-            if ($value === null && preg_match('/\b(?:value|worth|cost)\b[:\s]*([€£\$]?)\s*([0-9][0-9,\.]*)\s*([€£\$]?)\s*(EUR|USD|GBP)?\b/i', $line, $m)) {
-                $value = (float) str_replace(',', '.', $m[2]);
-                $symbol = $m[1] ?: $m[3];
-                $currency = $m[4] ?: ($symbol ? $this->ccyFromSymbol($symbol) : 'EUR');
-            }
-
-            // 8. DIMENSIONS extraction
-            if (!$pkgLength && preg_match('/\b(?:length|l)\b[:\s]*([0-9][0-9,\.]*)\s*(?:m|meter[s]?|cm)?\b/i', $line, $m)) {
-                $pkgLength = (float) str_replace(',', '.', $m[1]);
-                if (str_contains($line, 'cm')) $pkgLength /= 100; // Convert cm to meters
-            }
-            if (!$pkgWidth && preg_match('/\b(?:width|w)\b[:\s]*([0-9][0-9,\.]*)\s*(?:m|meter[s]?|cm)?\b/i', $line, $m)) {
-                $pkgWidth = (float) str_replace(',', '.', $m[1]);
-                if (str_contains($line, 'cm')) $pkgWidth /= 100;
-            }
-            if (!$pkgHeight && preg_match('/\b(?:height|h)\b[:\s]*([0-9][0-9,\.]*)\s*(?:m|meter[s]?|cm)?\b/i', $line, $m)) {
-                $pkgHeight = (float) str_replace(',', '.', $m[1]);
-                if (str_contains($line, 'cm')) $pkgHeight /= 100;
-            }
-
-            // 9. TEMPERATURE extraction
-            if ($tempMin === null && preg_match('/\b(?:temp|temperature)\b[:\s]*([+-]?[0-9][0-9,\.]*)\s*(?:°?c|celsius)?\b/i', $line, $m)) {
-                $tempMin = (float) str_replace(',', '.', $m[1]);
-            }
-            if ($tempMax === null && preg_match('/\b(?:temp|temperature)\b[:\s]*[+-]?[0-9][0-9,\.]*\s*(?:to|-)?\s*([+-]?[0-9][0-9,\.]*)\s*(?:°?c|celsius)?\b/i', $line, $m)) {
-                $tempMax = (float) str_replace(',', '.', $m[1]);
-            }
-
-            // 10. BOOLEAN flags extraction
-            if ($adr === null) $adr = preg_match('/\b(ADR|DANGEROUS|HAZARDOUS)\b/i', $upper) ? true : null;
-            if ($extraLift === null) $extraLift = preg_match('/\b(LIFT|CRANE|FORKLIFT)\b/i', $upper) ? true : null;
-            if ($palletized === null) $palletized = preg_match('/\b(PALLETIZED|ON\s*PALLETS)\b/i', $upper) ? true : null;
-            if ($manualLoad === null) $manualLoad = preg_match('/\b(MANUAL|HAND\s*LOAD)\b/i', $upper) ? true : null;
-
-            // 11. VEHICLE details extraction
-            if (!$vehicleMake && preg_match('/\b(BMW|MERCEDES|AUDI|VOLKSWAGEN|FORD|RENAULT|PEUGEOT|VOLVO|SCANIA|MAN)\b/i', $upper, $m)) {
-                $vehicleMake = strtoupper($m[1]);
-            }
-
-            // 12. NUMBER/REFERENCE extraction
-            if (!$number && preg_match('/\b(?:tracking|ref|reference|order|po)\b[:\s#]*([A-Z0-9\-\/]{4,})/i', $line, $m)) {
-                $number = trim($m[1]);
-            }
         }
 
         // Build cargo object according to schema
         $cargo = [
             'title' => $title ?: 'PACKAGING',
-            'type' => $type ?: 'FTL' // Default for TransAlliance
+            'type' => $type
         ];
 
         // Add optional fields only if they have valid values
-        if ($packageCount !== null && $packageCount > 0) {
-            $cargo['package_count'] = $packageCount;
-        }
-        if ($packageType) {
-            $cargo['package_type'] = $packageType;
-        }
-        if ($number) {
-            $cargo['number'] = $number;
-        }
-        if ($value !== null && $value > 0) {
-            $cargo['value'] = $value;
-        }
-        if ($currency) {
-            $cargo['currency'] = $currency;
-        }
-        if ($pkgWidth !== null && $pkgWidth > 0) {
-            $cargo['pkg_width'] = $pkgWidth;
-        }
-        if ($pkgLength !== null && $pkgLength > 0) {
-            $cargo['pkg_length'] = $pkgLength;
-        }
-        if ($pkgHeight !== null && $pkgHeight > 0) {
-            $cargo['pkg_height'] = $pkgHeight;
-        }
-        if ($ldm !== null && $ldm > 0) {
-            $cargo['ldm'] = $ldm;
-        }
-        if ($volume !== null && $volume > 0) {
-            $cargo['volume'] = $volume;
-        }
         if ($weight !== null && $weight > 0) {
             $cargo['weight'] = $weight;
         }
-        if ($chargeableWeight !== null && $chargeableWeight > 0) {
-            $cargo['chargeable_weight'] = $chargeableWeight;
+
+        if ($ldm !== null && $ldm > 0) {
+            $cargo['ldm'] = $ldm;
         }
-        if ($tempMin !== null) {
-            $cargo['temperature_min'] = $tempMin;
-        }
-        if ($tempMax !== null) {
-            $cargo['temperature_max'] = $tempMax;
-        }
-        if ($tempMode) {
-            $cargo['temperature_mode'] = $tempMode;
-        }
-        if ($adr === true) {
-            $cargo['adr'] = true;
-        }
-        if ($extraLift === true) {
-            $cargo['extra_lift'] = true;
-        }
-        if ($palletized === true) {
-            $cargo['palletized'] = true;
-        }
-        if ($manualLoad === true) {
-            $cargo['manual_load'] = true;
-        }
-        if ($vehicleMake) {
-            $cargo['vehicle_make'] = $vehicleMake;
-        }
-        if ($vehicleModel) {
-            $cargo['vehicle_model'] = $vehicleModel;
+
+        if ($packageCount !== null && $packageCount > 0) {
+            $cargo['package_count'] = $packageCount;
+            if ($packageType) {
+                $cargo['package_type'] = $packageType;
+            }
         }
 
         return [$cargo];
