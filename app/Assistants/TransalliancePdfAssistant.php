@@ -83,8 +83,12 @@ class TransalliancePdfAssistant extends PdfClient
             'loading_locations'      => $loadingStops,
             'destination_locations'  => $deliveryStops,
             'cargos'                 => filled($cargos) ? $cargos : [['title' => 'PACKAGING', 'type' => 'FTL']],
-            'comment'                => $comment,
         ];
+
+        // Only add comment if it's not null/empty - schema validation
+        if ($comment && trim($comment) !== '') {
+            $payload['comment'] = $comment;
+        }
 
         $this->createOrder($payload);
         return $payload;
@@ -515,25 +519,51 @@ class TransalliancePdfAssistant extends PdfClient
         $inInstructions = false;
 
         foreach ($lines as $line) {
+            $line = trim($line);
+            if (empty($line)) continue;
+
             $upper = str($line)->upper();
 
+            // Look for Instructions section
             if ($upper->contains('INSTRUCTIONS')) {
                 $inInstructions = true;
                 continue;
             }
 
             if ($inInstructions) {
-                if ($upper->contains(['DELIVERY', 'OBSERVATIONS'])) {
+                // Stop at next major section
+                if ($upper->contains(['DELIVERY', 'OBSERVATIONS', 'CUSTOMS INSTRUCTIONS'])) {
                     break;
                 }
 
-                if ($upper->contains(['BARCODE', 'GMR', 'ORANGE LANE', 'PORT']) && strlen(trim($line)) > 10) {
-                    $instructionLines[] = trim($line);
+                // Capture relevant instruction lines
+                if ($upper->contains(['BARCODE', 'GMR', 'ORANGE LANE', 'PORT', 'SCAN', 'EXIT']) && strlen($line) > 10) {
+                    $instructionLines[] = $line;
                 }
+            }
+
+            // Also look for specific instruction patterns anywhere in document
+            if ($upper->contains(['BARCODE', 'GMR']) && $upper->contains(['SCAN', 'PORT']) && strlen($line) > 20) {
+                $instructionLines[] = $line;
             }
         }
 
-        return filled($instructionLines) ? implode(' ', $instructionLines) : null;
+        // Clean up and deduplicate instructions
+        $instructionLines = array_unique($instructionLines);
+        $instructionLines = array_filter($instructionLines, fn($line) => strlen(trim($line)) > 10);
+
+        if (empty($instructionLines)) {
+            return null;
+        }
+
+        // Join instructions with proper separator
+        $comment = implode(' ', $instructionLines);
+
+        // Clean up the comment
+        $comment = preg_replace('/\s+/', ' ', $comment);
+        $comment = trim($comment);
+
+        return strlen($comment) > 0 ? $comment : null;
     }
 
     protected function fallbackOrderRef(array $lines, ?string $filename = null): ?string
