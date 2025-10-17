@@ -261,7 +261,8 @@ class TransalliancePdfAssistant extends PdfClient
     protected function parseStopFromSection(array $lines, int $startIdx): ?array
     {
         $company = null; $street = null; $city = null; $post = null; $country = null;
-        $dateTime = null; $timeFrom = null; $timeTo = null;
+        $dateTime = null; $timeFrom = null; $timeTo = null; $comment = null;
+        $additionalAddressInfo = [];
 
         for ($i = $startIdx + 1; $i < min($startIdx + 20, count($lines)); $i++) {
             if (!isset($lines[$i])) break;
@@ -280,7 +281,7 @@ class TransalliancePdfAssistant extends PdfClient
                 continue;
             }
 
-            // Look for company name (e.g., "ICONEX" or "ICONEX FRANCE")
+            // Look for company name (e.g., "ICONEX" or "EP GROUP FRANCE")
             if (!$company && preg_match('/^[A-Z][A-Z\s]+$/', $line) &&
                 !str_contains($upper, 'REFERENCE') &&
                 !str_contains($upper, 'CONTACT') &&
@@ -291,13 +292,7 @@ class TransalliancePdfAssistant extends PdfClient
                 continue;
             }
 
-            // Look for street address
-            if (!$street && $this->looksLikeStreet($line)) {
-                $street = $line;
-                continue;
-            }
-
-            // Look for postcode and city (e.g., "GB-PE2 6DP PETERBOROUGH" or "-37530 POCE-SUR-CISSE")
+            // Look for postcode and city first (most specific)
             if (preg_match('/^([A-Z]{2}-)([A-Z0-9\s]+)\s+([A-Z\s\-]+)$/i', $line, $m)) {
                 $country = substr($m[1], 0, 2);
                 $post = trim($m[2]);
@@ -308,6 +303,12 @@ class TransalliancePdfAssistant extends PdfClient
                 $post = $m[1];
                 $city = trim($m[2]);
                 $country = 'FR';
+                continue;
+            }
+
+            // Look for street address - prioritize specific street patterns
+            if (!$street && $this->looksLikeSpecificStreet($line)) {
+                $street = $line;
                 continue;
             }
 
@@ -323,25 +324,54 @@ class TransalliancePdfAssistant extends PdfClient
                 }
                 continue;
             }
+
+            // Collect additional address information that doesn't fit other categories
+            if ($company && // Only after we have a company
+                !$this->isIgnorableLine($line) &&
+                !str_contains($upper, 'CONTACT') &&
+                !str_contains($upper, 'TEL') &&
+                !str_contains($upper, 'REFERENCE') &&
+                strlen($line) > 2) {
+
+                // Check if this looks like zone/district info (like "ZI DISTRIPORT")
+                if ($this->looksLikeZoneOrDistrict($line)) {
+                    $additionalAddressInfo[] = $line;
+                } elseif (!$street && $this->looksLikeStreet($line)) {
+                    // This is a fallback street if we haven't found a specific one
+                    $street = $line;
+                }
+            }
         }
 
         if (!$company) return null;
 
-        $result = [
-            'company_address' => array_filter([
-                'company' => $company,
-                'street_address' => $street,
-                'city' => $city,
-                'postal_code' => $post,
-                'country' => $country,
-            ], fn($v) => !blank($v))
-        ];
+        // Build the address
+        $address = array_filter([
+            'company' => $company,
+            'street_address' => $street,
+            'city' => $city,
+            'postal_code' => $post,
+            'country' => $country,
+        ], fn($v) => !blank($v));
 
+        // Add additional address info as comment if we have it
+        if (!empty($additionalAddressInfo)) {
+            $address['comment'] = implode(', ', $additionalAddressInfo);
+        }
+
+        $result = ['company_address' => $address];
+
+        // Add time information
         if ($timeFrom) {
             $result['time'] = array_filter([
                 'datetime_from' => $timeFrom,
                 'datetime_to' => $timeTo
             ], fn($v) => !blank($v));
+        } elseif ($dateTime) {
+            // If we have a date but no specific time, use start of day
+            $result['time'] = [
+                'datetime_from' => $dateTime . 'T00:00:00'
+            ];
         }
 
         return $result;
@@ -353,6 +383,54 @@ class TransalliancePdfAssistant extends PdfClient
         [$day, $month, $year] = explode('/', $dateStr);
         $fullYear = '20' . $year;
         return sprintf('%s-%02d-%02d', $fullYear, (int)$month, (int)$day);
+    }
+
+    /**
+     * Check if a line looks like a specific street address (with numbers)
+     */
+    protected function looksLikeSpecificStreet(string $line): bool
+    {
+        $upper = str($line)->upper()->toString();
+
+        // Look for numbered streets like "2 RUE DE TOKYO"
+        if (preg_match('/^\d+\s+/', $line)) {
+            return true;
+        }
+
+        // Look for street keywords with context
+        return (bool) preg_match('/\b(RUE|ROAD|RD|ST|STREET|LANE|AVE|AVENUE|CHEMIN|CHEM\.|WAY|PARK|COURT|RTE|DR|PLACE|BLVD|GATEWAY|PORT|CROSSING|COURSE|QUAI|BAKEWELL|LONDON GATEWAY|INDUSTRIES)\b/i', $line);
+    }
+
+    /**
+     * Check if a line looks like a zone or district designation
+     */
+    protected function looksLikeZoneOrDistrict(string $line): bool
+    {
+        $upper = str($line)->upper()->toString();
+
+        // Common zone/district patterns
+        return (bool) preg_match('/\b(ZI|ZONE|DISTRICT|PARC|PARK|CENTRE|CENTER|COMPLEX|DISTRIPORT|INDUSTRIAL|COMMERCIAL)\b/i', $upper);
+    }
+
+    /**
+     * Check if a line should be ignored during address parsing
+     */
+    protected function isIgnorableLine(string $line): bool
+    {
+        $upper = str($line)->upper()->toString();
+
+        // Skip common non-address lines
+        return str_contains($upper, 'PAYMENT') ||
+               str_contains($upper, 'VIREMENT') ||
+               str_contains($upper, 'LM . . .') ||
+               str_contains($upper, 'PARC. NB') ||
+               str_contains($upper, 'PAL. NB') ||
+               str_contains($upper, 'WEIGHT') ||
+               str_contains($upper, 'KGS') ||
+               str_contains($upper, 'M. NATURE') ||
+               str_contains($upper, 'TRACT.') ||
+               str_contains($upper, 'TRAIL.') ||
+               preg_match('/^[0-9,\.]+$/', $line); // Pure numeric lines
     }
 
     /* ===================== Enhanced Cargo Extraction for TransAlliance Format ===================== */
